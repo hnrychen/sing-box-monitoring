@@ -1,0 +1,24 @@
+{
+  "listen": "127.0.0.1:9119",
+  "scrape_token": "GENERATE_A_RANDOM_TOKEN_DO_NOT_USE_THIS_PLACEHOLDER",
+  "tls_cert": "/etc/sing-box-exporter/server.crt",
+  "tls_key": "/etc/sing-box-exporter/server.key",
+  "source_mode": "off",
+  "max_sources": 32,
+  "max_connections": 4096,
+  "poll_interval": 10,
+  "tcp_rtt": true,
+  "tcp_poll_interval": 30,
+  "tcp_max_idle": 120,
+  "process_interval": 30,
+  "source_state": "/var/lib/sing-box-exporter/source-slots.json",
+  "services": [
+    {
+      "name": "sing-box",
+      "url": "http://127.0.0.1:19090",
+      "secret": "GENERATE_AN_INDEPENDENT_API_SECRET",
+      "inbounds": {"ss-in": {"type": "shadowsocks", "port": 10443}},
+      "outbounds": ["direct"]
+    }
+  ]
+}

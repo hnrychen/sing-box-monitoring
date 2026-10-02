@@ -1,0 +1,39 @@
+groups:
+  - name: sing-box
+    interval: 30s
+    rules:
+      - alert: SingBoxExporterUnavailable
+        expr: up{job="sing-box"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "sing-box exporter unavailable on {{ $labels.instance }}"
+      - alert: SingBoxApiUnavailable
+        expr: singbox_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "sing-box API unavailable: {{ $labels.instance }} / {{ $labels.service }}"
+      - alert: SingBoxTcpDiagnosticsUnavailable
+        expr: singbox_tcp_collector_up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TCP RTT diagnostics unavailable on {{ $labels.instance }}"
+      - alert: SingBoxSourceSlotsFull
+        expr: singbox_exporter_source_slots >= singbox_exporter_source_slots_limit
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Source slots full on {{ $labels.instance }}; new clients aggregate as other"
+      - alert: SingBoxExporterCertificateExpiring
+        expr: singbox_exporter_certificate_expiry_timestamp_seconds - time() < 30 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "sing-box exporter certificate expires within 30 days on {{ $labels.instance }}"

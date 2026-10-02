@@ -1,0 +1,23 @@
+services:
+  exporter:
+    build: .
+    restart: always
+    network_mode: host
+    user: "${EXPORTER_UID:-65534}:${EXPORTER_GID:-65534}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    cpus: "${EXPORTER_CPUS:-0.02}"
+    pids_limit: 16
+    volumes:
+      - /etc/sing-box-exporter:/config:ro
+      - /var/lib/sing-box-exporter:/var/lib/sing-box-exporter
+    healthcheck:
+      test: [CMD, python3, /app/healthcheck.py]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # In config.json, change tls_cert/tls_key to /config/server.crt and
+    # /config/server.key. Set UID/GID to the native exporter user's numeric IDs.
+    # Firewall and sing-box API setup remain required; do not run both agents.
