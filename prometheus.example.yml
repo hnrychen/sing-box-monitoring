@@ -9,7 +9,7 @@ scrape_configs:
   - job_name: sing-box-proxy-1
     scrape_interval: 10s
     scrape_timeout: 5s
-    sample_limit: 5000
+    sample_limit: 0  # No source-IP count cutoff; byte/time/resource guards remain.
     label_limit: 12
     body_size_limit: 8MB
     scheme: https
@@ -25,3 +25,13 @@ scrape_configs:
       - targets: ['192.0.2.10:9119']
         labels:
           instance: proxy-1
+
+  # Optional central enrichment; enable only after installing its loopback worker.
+  # - job_name: source-ipinfo
+  #   scrape_interval: 5s
+  #   scrape_timeout: 4s
+  #   sample_limit: 0
+  #   label_limit: 8
+  #   body_size_limit: 1MB
+  #   static_configs:
+  #     - targets: ['127.0.0.1:9120']

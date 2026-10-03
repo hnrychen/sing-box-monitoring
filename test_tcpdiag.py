@@ -46,8 +46,9 @@ class TcpTests(unittest.TestCase):
         self.assertEqual(self.collector.tcp['unmatched'], 1)
 
     def test_source_cardinality_and_privacy(self):
-        self.collector.tcp_update([dict(self.record, peer_ip=f'198.51.100.{i}') for i in range(1, 10)])
-        self.assertEqual(len(self.collector.tcp['sources']), 3)
+        self.collector.tcp_update([dict(self.record, peer_ip=f'2001:db8::{i:x}') for i in range(1000)])
+        self.assertEqual(len(self.collector.tcp['sources']), 1000)
+        self.assertNotIn('source_ip="other"', self.collector.render().decode())
         self.collector.config['source_mode'] = 'off'
         self.collector.tcp_update([self.record])
         text = self.collector.render().decode()

@@ -7,11 +7,13 @@ capture, eBPF, log scraping, database, or active background latency probes.
 ## Features
 
 - Fleet traffic and availability, inbound protocol inventory, live connections,
-  TCP/UDP session breakdowns, egress routing, and bounded source-IP activity.
+  TCP/UDP session breakdowns, egress routing, and individual source-IP activity.
 - Passive client-facing **TCP RTT**: socket-weighted mean, current-socket p95,
   maximum, per-source mean, coverage, and last-ACK age.
   Source connections retains a compact two-column layout and shows Protocol,
   activity and mean RTT together; maximum RTT remains in the latency chart.
+- Optional **central IPinfo Lite enrichment**: country flags before source IPs
+  in both tables, plus Organization (`as_name`) in Source connections. Proxy agents need no changes.
 - Native process CPU/RSS/uptime, exporter health/resources, authenticated HTTPS,
   CA-pinned scrapes, and optional alert rules.
 - Configurable sampling and resource limits per host. One exporter per server;
@@ -68,8 +70,7 @@ sudo python3 install.py \
 
 The examples use reserved documentation addresses, not real machines. The
 installer creates `/opt/sing-box-exporter/{exporter,tcpdiag}.py`, protected
-configuration/TLS files in `/etc/sing-box-exporter`, persistent source slots in
-`/var/lib/sing-box-exporter`, and two enabled systemd units. Exporter port 9119 is
+configuration/TLS files in `/etc/sing-box-exporter` and two enabled systemd units. Exporter port 9119 is
 allowed only from loopback and the monitoring IP using a dedicated nftables
 table; existing rules are not flushed. Existing stricter firewalls must also
 permit the monitoring source. It refuses an existing non-loopback Clash API.
@@ -126,6 +127,44 @@ first. Anonymous access/public dashboard sharing is never enabled automatically.
 `build_dashboard.py` regenerates the portable dashboard. It includes no fixed
 links to dashboards that might not exist on someone else's Grafana.
 
+### Optional host flag prefixes
+
+Create a private JSON mapping of raw host IDs to display labels, for example
+`{"proxy-1": "🇸🇬 proxy-1"}`. The hostname must remain after the prefix.
+Pass `--host-labels /path/to/host-labels.json` to `publish_dashboard.py` when
+importing the portable dashboard. To update existing dashboards in place:
+
+```sh
+python3 host_labels.py --labels /path/to/host-labels.json \
+  --uid YOUR_SING_BOX_UID --uid YOUR_NODE_EXPORTER_UID \
+  --credentials-stdin --backup-dir /private/dashboard-backups
+```
+
+Supply Grafana credentials as the same JSON stdin object used by the publisher.
+This preserves metric calculations, layout, filters, refresh and access. Friendly
+selector text is separate from raw values; tables use value mappings and legends
+use a display-only query-result label. Modified targets retain their base
+expression/legend for repeatable updates. Stored Prometheus/exporter labels and history do not change.
+Unknown hosts remain visible under their original names. Keep machine-specific
+mapping files private; the generic dashboard does not hardcode host locations.
+
+Windows Chrome/Edge can show country letters instead of emoji flags. The optional
+Grafana image customization self-hosts a 78KB flag-only font. Ordinary text still
+uses Inter, and code retains its own font. It does not affect exporters:
+
+```sh
+python3 fetch_flag_font.py
+docker build -f grafana-flags.Dockerfile \
+  --build-arg BASE_IMAGE=YOUR_EXISTING_PINNED_GRAFANA_IMAGE \
+  -t grafana-country-flags:local .
+```
+
+Update only the Grafana image in your existing deployment, preserving all data
+volumes, secrets, networks, ports and other settings. Rebuild this customization
+when upgrading Grafana; it modifies the frontend template to load a separate,
+cache-versioned stylesheet. No client extension or external font CDN is needed
+after deployment. See `FLAG-FONT-LICENSE.md` for Twemoji/Mozilla/TalkJS attribution.
+
 ## Manual / container deployment
 
 For an existing Clash API or nonstandard layout, start from
@@ -168,12 +207,12 @@ security maintenance.
 | `singbox_up`, `collection_*`, `last_success_timestamp_seconds` | API success/freshness; failed/stale snapshots omit traffic |
 | `singbox_traffic_bytes_total{direction}` | Exact API payload totals since core start, including short-lived sessions; excludes wire overhead |
 | `singbox_connections`, `route_connections` | Current routed connections/UDP sessions, excluding DNS outbound; bounded route groups reconcile to total |
-| `singbox_source_protocol_connections` | Current routed sessions by protocol and bounded source IP; reconciles to total, including explicit overflow |
+| `singbox_source_protocol_connections` | Current routed sessions by protocol and individual source IP; reconciles to total without IP overflow |
 | `singbox_route_active_bytes`, `source_active_bytes` | Lifetime bytes of **currently active** connections; gauges, not counters |
 | `singbox_route_observed_bytes_total`, `source_observed_bytes_total` | Sampled lower bounds; misses short sessions and bytes after their final sample |
 | `singbox_inbound_info`, `process_*`, `exporter_*` | Inventory, native process resources, collection/resource/TLS health |
 | `singbox_tcp_rtt_snapshot_{bucket,sum,count}` | Current physical TCP socket RTT distribution; **all gauges** |
-| `singbox_tcp_rtt_max_seconds`, `tcp_source_rtt_*` | Maximum and bounded per-peer RTT summaries |
+| `singbox_tcp_rtt_max_seconds`, `tcp_source_rtt_*` | Maximum and per-peer RTT summaries without an IP-count cap |
 | `singbox_tcp_established_sockets`, `tcp_ack_age_max_seconds`, `tcp_collector_*` | Socket coverage, ACK age and independent diagnostic health |
 
 Upload means client → destination; download means destination → client. Fleet
@@ -218,15 +257,29 @@ histogram_quantile(0.95,
 ### Privacy, bounds and low-resource behavior
 
 Source mode defaults to `off`; choose `subnet` (IPv4 /24, IPv6 /64) or opt into
-`raw`. Default 32 persistent source slots, installer maximum 64; excess IPs
-aggregate under `other`. No connection IDs, ephemeral ports, domains or
-destination IPs become labels. Do not routinely reset slots: that expands
-historical cardinality. Restrict access and retain data deliberately.
+`raw`. There is no source-IP count limit or source overflow bucket, including
+protocol connection counts and TCP RTT. Legacy `max_sources`/`source_state`
+configuration is ignored. Inactive sampled source counters expire after one hour
+(`source_idle_ttl`, installer `--source-idle-ttl`); active sources are not evicted.
+No connection IDs, ephemeral ports, domains or destination IPs become labels.
+More distinct IPs increase historical TSDB cardinality: restrict access and retain
+data deliberately. Old `other` history cannot be split back into individual IPs.
+
+Upgrade existing agents by replacing `/opt/sing-box-exporter/exporter.py` with
+the current file and restarting `sing-box-exporter.service`; preserve existing
+config, secrets, TLS and CPU/memory settings. Old slot files can remain for
+rollback but are no longer read or written. Update the central
+`/opt/sing-box-ipinfo/ipinfo_exporter.py` and restart `sing-box-ipinfo.service`;
+legacy `max_ips` is ignored. Change `sample_limit` to `0` on source scrape jobs,
+remove `SingBoxSourceSlotsFull` from rules, validate using `promtool`, and reload
+Prometheus. Republish the dashboard with the same UID and any existing host-label
+mapping. No sing-box proxy restart or historic-data deletion is needed.
 
 Collection is cached independently of scraping/UI refresh. API and TCP snapshots
 have byte/socket budgets (8 MiB / 4096 by default); interrupted or oversized dumps
 fail visibly rather than publishing truncated exact-looking data. TCP requests
-are filtered by local port inside the kernel. Source/route dimensions are bounded.
+are filtered by local port inside the kernel. Route dimensions remain bounded;
+source-IP counts are not. Scrape sample-count limits are disabled for source jobs.
 Native default limits include 64 MiB memory, 16 tasks and 128 FDs, with configurable
 CPU quota. Increasing inventory/cardinality requires reviewing Prometheus sample
 limits and collector budgets. Resource usage is workload-dependent, not guaranteed.
@@ -266,6 +319,72 @@ Remove only this project's scrape/rule entries from your current Prometheus
 configuration, validate/reload, then remove the exporter firewall unit/table and
 runtime secrets/state when no longer needed. Existing services/rules/history are
 not cleanup targets. This project never flushes a host firewall.
+
+## Optional central IPinfo lookup
+
+Run `install_ipinfo.py` only on the central Prometheus machine (Linux/systemd,
+Python 3.11+), not on every proxy. It reads the source-IP labels
+from local Prometheus, skips private/reserved/multicast IPs and privacy/overflow
+placeholders, and stores one country/ASN record per distinct public IP. Raw-IP
+source mode is required; subnet and hidden labels deliberately are not queried.
+
+Supply an IPinfo Lite token via stdin, never a command argument or tracked file:
+
+```sh
+# Supply {"token":"YOUR_TOKEN"} privately on stdin, for example from a secret
+# manager. The installer intentionally does not accept --token as an argument.
+sudo python3 install_ipinfo.py --token-stdin
+```
+
+Token/config permissions are root/worker-group only under `/etc/sing-box-ipinfo`.
+Metrics bind to IPv4 loopback `127.0.0.1:9120`; Prometheus must share the host
+network. Uncomment the optional job in `prometheus.example.yml`, validate with
+`promtool check config`, then reload. The installer's optional
+`--integrate-prometheus /ABSOLUTE/prometheus.yml` automates integration only for
+an existing host-network Docker Prometheus with the documented
+`/etc/prometheus/sing-box` bind mount. Other layouts require manual integration;
+do not expose port 9120 publicly. Grafana dashboard UID stays `sing-box-fleet`;
+its title is `sing-box monitor`.
+
+Defaults: discover sources every 2s, retain inactive cache entries for seven days,
+no IP-count limit, at most 32 lookups per cycle and ten per second, four-second HTTP
+timeouts. New uncached IPs take priority over expired cache refreshes. Configure
+`discovery_interval` (1–3600 seconds), `lookup_spacing` (0.1–60 seconds), and
+`lookup_batch` (1–256) in the worker config to tune pacing. Prometheus scrapes
+the enrichment worker every 5s; the dashboard defaults to 5s refresh.
+Errors back off; authentication/rate-limit failures pause external
+requests for an hour. Last-good attribution survives temporary API failures,
+but is omitted after 30 days without refresh. API calls never run in scrape
+handlers or browser refreshes. The native worker has a 64MiB memory limit and
+5% one-core CPU cap; the proxy service is unaffected. Its systemd state directory
+contains private source-IP cache data and is not suitable for publication.
+
+Lookup failures or an uninstalled worker leave the original source rows/values
+intact through an explicit left join. Country/ASN describe the observed peer IP,
+not authenticated user identity or residence. Public IPs are sent to IPinfo;
+enable this opt-in service only if appropriate for your privacy policy. The
+token is never included in metrics, dashboard JSON, URLs, logs or public sources.
+Organization is displayed in a wide, wrapping column instead of numeric ASN.
+Source connections occupies 19/24 width beside the narrow Source IPs chart;
+Observed source bandwidth is below, beside Source active-connection bytes.
+Source active-connection bytes shows one row per host/source IP with Upload and
+Download columns instead of separate direction rows; sorted by Download, with
+the existing byte-gauge meaning and host/service filters unchanged.
+ASN remains available in metadata, but hidden from the table.
+Attribution changes can create new metadata time series; cache cardinality
+is time-managed, while historical series remain until Prometheus retention removes them.
+
+Flag icons are tiny PNGs bundled into the dashboard's value mappings, with no
+browser network requests or reliance on platform emoji fonts. `flags.json` and
+`FLAGS-LICENSE.txt` must accompany `build_dashboard.py`; ordinary builds use the
+committed bundle and need no network/browser dependencies. To regenerate assets,
+run `fetch_flags.py` (pinned flag-icons source), then `bundle_flags.cjs` with an
+installed Playwright and Edge (or override `FLAG_BROWSER_CHANNEL`). Flag-icons
+is MIT licensed; retain `FLAGS-LICENSE.txt`. The core remains dependency-free.
+
+Run `python3 -m unittest -v test_ipinfo` for cache/privacy/failure tests, and
+`python3 verify_ipinfo.py` on the central host for real PromQL join/fallback
+reconciliation without making additional external lookups.
 
 ## License and upstream references
 

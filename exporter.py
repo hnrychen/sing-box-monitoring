@@ -17,7 +17,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import tcpdiag
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 MAX_RESPONSE = 8 * 1024 * 1024
 API_CLIENT = threading.local()
 RTT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1, 2, 5, math.inf)
@@ -76,12 +76,6 @@ class Collector:
         self.config = config
         self.lock = threading.Lock()
         self.state = {}
-        self.sources = []
-        path = config.get('source_state')
-        if path and os.path.exists(path):
-            with open(path) as stream:
-                self.sources = json.load(stream)[:config.get('max_sources', 32)]
-        self.last_save = 0
         self.started = time.time()
         self.renders = 0
         self.processes = {}
@@ -126,11 +120,6 @@ class Collector:
             address = str(ip) if mode == 'raw' else str(ipaddress.ip_network(f'{ip}/{24 if ip.version == 4 else 64}', strict=False))
         except ValueError:
             return 'unknown'
-        if address in self.sources:
-            return address
-        if len(self.sources) >= self.config.get('max_sources', 32):
-            return 'other'
-        self.sources.append(address)
         return address
 
     def tcp_update(self, records, now=None):
@@ -172,8 +161,6 @@ class Collector:
             for index, bound in enumerate(RTT_BUCKETS):
                 group['buckets'][index] += int(rtt <= bound)
             source = self.source(record['peer_ip'])
-            if key + (source,) not in sources and len(sources) >= 128:
-                source = 'other'
             values = sources.setdefault(key + (source,), [0, 0, 0, 0])
             values[0] += 1
             values[1] += rtt
@@ -220,6 +207,7 @@ class Collector:
         source_protocols = collections.defaultdict(int)
         observed = collections.defaultdict(lambda: [0, 0, 0], {k: v.copy() for k, v in old.get('observed', {}).items()})
         source_observed = collections.defaultdict(lambda: [0, 0], {k: v.copy() for k, v in old.get('source_observed', {}).items()})
+        source_seen = old.get('source_seen', {}).copy()
         following = {}
         dropped = 0
         connections = data.get('connections') or []
@@ -248,9 +236,8 @@ class Collector:
                 dropped += 1
             source = self.source(str(md.get('sourceIP', '')))
             source_protocol = (protocol, source)
-            if source_protocol not in source_protocols and len(source_protocols) >= 128:
-                source_protocol = ('other', 'other')
             source_protocols[source_protocol] += 1
+            source_seen[source] = now
             upload, download = max(0, int(conn.get('upload', 0))), max(0, int(conn.get('download', 0)))
             cid = str(conn['id'])
             before = previous.get(cid)
@@ -278,6 +265,11 @@ class Collector:
             s[0] += 1
             s[1] += upload
             s[2] += download
+        # Time-based cleanup only: never merge or evict an active IP to meet a
+        # count budget. Prometheus retains the historical samples independently.
+        idle_ttl = max(60, self.config.get('source_idle_ttl', 3600))
+        source_seen = {ip: seen for ip, seen in source_seen.items() if now - seen <= idle_ttl}
+        source_observed = {ip: values for ip, values in source_observed.items() if ip in source_seen}
         # Zero series for known idle inbounds, retaining protocol visibility.
         for inbound, info in inventory.items():
             for network in ('tcp', 'udp'):
@@ -285,7 +277,7 @@ class Collector:
                 observed[(info['type'], inbound, network, 'direct')]
         self.state[name] = dict(up=1, timestamp=now, totals=totals, memory=data['memory'],
                                 groups=groups, sources=sources, source_protocols=source_protocols, previous=following,
-                                observed=observed, source_observed=source_observed,
+                                observed=observed, source_observed=source_observed, source_seen=source_seen,
                                 errors=old.get('errors', 0), resets=old.get('resets', 0) + int(reset),
                                 dropped=dropped, connections=len(connections), duration=0)
 
@@ -309,17 +301,6 @@ class Collector:
         while True:
             started = time.monotonic()
             self.poll(service)
-            with self.lock:
-                path = self.config.get('source_state')
-                if path and time.time() - self.last_save >= 60:
-                    try:
-                        temp = path + '.tmp'
-                        with open(temp, 'w') as stream:
-                            json.dump(self.sources, stream)
-                        os.replace(temp, path)
-                        self.last_save = time.time()
-                    except OSError:
-                        logging.error('Cannot persist source slots')
             time.sleep(max(0.2, interval - (time.monotonic() - started)))
 
     def render(self):
@@ -358,11 +339,11 @@ class Collector:
                     m.add('route_observed_connections_total', values[2], gtags, 'New connections seen after first snapshot; sampling lower bound.', 'counter')
                 for source, values in s['sources'].items():
                     stags = dict(tags, source_ip=source)
-                    m.add('source_connections', values[0], stags, 'Active connections by bounded source IP slot.')
+                    m.add('source_connections', values[0], stags, 'Active connections by source IP; no IP-count cap.')
                     for direction, value in zip(('upload', 'download'), values[1:]):
                         m.add('source_active_bytes', value, dict(stags, direction=direction), 'Lifetime bytes of active connections for this source.')
                 for (protocol, source), count in s['source_protocols'].items():
-                    m.add('source_protocol_connections', count, dict(tags, protocol=protocol, source_ip=source), 'Active routed sessions by protocol and bounded source IP; at most 128 groups plus overflow.')
+                    m.add('source_protocol_connections', count, dict(tags, protocol=protocol, source_ip=source), 'Active routed sessions by protocol and source IP; no IP-count cap.')
                 for source, values in s['source_observed'].items():
                     for direction, value in zip(('upload', 'download'), values):
                         m.add('source_observed_bytes_total', value, dict(tags, source_ip=source, direction=direction), 'Sampled source bytes; NOT billing grade.', 'counter')
@@ -392,9 +373,14 @@ class Collector:
                     for key, values in self.tcp['sources'].items():
                         tags = dict(zip(('service', 'protocol', 'inbound', 'source_ip'), key))
                         for name, value in zip(('count', 'sum', 'max_seconds', 'ack_age_max_seconds'), values):
-                            m.add('tcp_source_rtt_' + name, value, tags, 'Current TCP peer RTT summary; bounded source labels, recent ACK only. All gauges.')
-            m.add('exporter_source_slots', len(self.sources), {}, 'Persistent distinct source labels assigned; full slots aggregate other.')
-            m.add('exporter_source_slots_limit', self.config.get('max_sources', 32), {}, 'Maximum distinct source IP labels per host.')
+                            m.add('tcp_source_rtt_' + name, value, tags, 'Current TCP peer RTT summary by IP; recent ACK only. All gauges.')
+            active_sources = set()
+            tracked_sources = set()
+            for state in self.state.values():
+                active_sources.update(state.get('sources', {}))
+                tracked_sources.update(state.get('source_seen', {}))
+            m.add('exporter_source_ips_active', len(active_sources), {}, 'Distinct source labels in latest service snapshots.')
+            m.add('exporter_source_ips_tracked', len(tracked_sources), {}, 'Source counters retained until one hour idle by default; no IP-count cap.')
             if self.certificate_expiry:
                 m.add('exporter_certificate_expiry_timestamp_seconds', self.certificate_expiry, {}, 'HTTPS certificate expiry; renew and restart exporter before this time.')
         usage = resource.getrusage(resource.RUSAGE_SELF)

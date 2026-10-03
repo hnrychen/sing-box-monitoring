@@ -40,10 +40,13 @@ class CollectorTests(unittest.TestCase):
         self.collector.update(self.service, self.snapshot)
         self.assertEqual(self.collector.state['sing-box']['resets'], 1)
 
-    def test_source_label_cap(self):
+    def test_source_labels_have_no_count_cap_even_with_legacy_config(self):
         self.assertEqual(self.collector.source('192.0.2.1'), '192.0.2.1')
         self.assertEqual(self.collector.source('192.0.2.2'), '192.0.2.2')
-        self.assertEqual(self.collector.source('192.0.2.3'), 'other')
+        self.assertEqual(self.collector.source('192.0.2.3'), '192.0.2.3')
+        for i in range(1, 10001):
+            address = f'2001:db8::{i:x}'
+            self.assertEqual(self.collector.source(address), address)
         self.assertEqual(self.collector.source('garbage'), 'unknown')
 
     def test_subnet_privacy(self):
@@ -70,7 +73,7 @@ class CollectorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.collector.update(self.service, self.snapshot)
 
-    def test_persistent_source_slots(self):
+    def test_legacy_slot_state_does_not_restrict_new_sources(self):
         import json
         import pathlib
         with tempfile.TemporaryDirectory() as directory:
@@ -78,7 +81,33 @@ class CollectorTests(unittest.TestCase):
             path.write_text(json.dumps(['192.0.2.1', '192.0.2.2']))
             config = dict(self.collector.config, source_state=str(path))
             other = exporter.Collector(config)
-            self.assertEqual(other.source('192.0.2.3'), 'other')
+            self.assertEqual(other.source('192.0.2.3'), '192.0.2.3')
+            self.assertEqual(json.loads(path.read_text()), ['192.0.2.1', '192.0.2.2'])
+
+    def test_many_source_ips_reconcile_without_overflow(self):
+        self.snapshot['connections'] = [dict(id=str(i), metadata=dict(type='shadowsocks/ss', network='tcp',
+            sourceIP=f'2001:db8::{i:x}'), upload=10, download=20, chains=['relay']) for i in range(1000)]
+        self.collector.update(self.service, self.snapshot)
+        self.collector.update(self.service, self.snapshot)
+        state = self.collector.state['sing-box']
+        self.assertEqual(len(state['sources']), 1000)
+        self.assertEqual(len(state['source_protocols']), 1000)
+        self.assertEqual(len(state['source_observed']), 1000)
+        self.assertEqual(sum(state['source_protocols'].values()), 1000)
+        self.assertNotIn('source_ip="other"', self.collector.render().decode())
+
+    def test_inactive_counter_cleanup_is_time_based_not_count_based(self):
+        self.collector.update(self.service, self.snapshot, now=10000)
+        self.collector.update(self.service, self.snapshot, now=10001)
+        empty = dict(self.snapshot, connections=[])
+        self.collector.update(self.service, empty, now=11000)
+        state = self.collector.state['sing-box']
+        self.assertEqual(state['sources'], {})
+        self.assertIn('192.0.2.1', state['source_observed'])
+        self.collector.update(self.service, empty, now=14000)
+        self.assertEqual(self.collector.state['sing-box']['source_observed'], {})
+        self.collector.update(self.service, self.snapshot, now=14001)
+        self.assertIn('192.0.2.1', self.collector.state['sing-box']['sources'])
 
     def test_arbitrary_configured_protocol(self):
         self.service['inbounds'] = {'quic-in': {'type': 'tuic'}}
@@ -100,7 +129,7 @@ class CollectorTests(unittest.TestCase):
         self.collector.update(self.service, self.snapshot)
         self.assertLessEqual(len(self.collector.state['sing-box']['observed']), 129)
         self.assertEqual(sum(v[0] for v in self.collector.state['sing-box']['groups'].values()), 300)
-        self.assertLessEqual(len(self.collector.state['sing-box']['source_protocols']), 129)
+        self.assertEqual(len(self.collector.state['sing-box']['source_protocols']), 300)
         self.assertEqual(sum(self.collector.state['sing-box']['source_protocols'].values()), 300)
 
     def test_source_protocol_counts_reconcile(self):

@@ -41,7 +41,7 @@ def main():
     parser.add_argument('--certificate-ip', required=True, help='IP used by Prometheus for HTTPS verification')
     parser.add_argument('--listen', default='0.0.0.0:9119')
     parser.add_argument('--source-mode', choices=['off', 'subnet', 'raw'], default='off')
-    parser.add_argument('--max-sources', type=int, default=32)
+    parser.add_argument('--source-idle-ttl', type=int, default=3600, help='Seconds to retain inactive source counters; no IP-count limit')
     parser.add_argument('--poll-interval', type=int, default=5)
     parser.add_argument('--tcp-rtt', action='store_true', help='Enable unprivileged Linux TCP RTT snapshots')
     parser.add_argument('--tcp-poll-interval', type=int, default=30)
@@ -54,8 +54,8 @@ def main():
         parser.error('run as root')
     monitor = str(ipaddress.IPv4Address(args.monitor_ip))
     certificate_ip = str(ipaddress.IPv4Address(args.certificate_ip))
-    if not 1 <= args.max_sources <= 64:
-        parser.error('--max-sources must be 1..64')
+    if args.source_idle_ttl < 60:
+        parser.error('--source-idle-ttl must be at least 60 seconds')
     if any(not 2 <= v <= 300 for v in (args.poll_interval, args.tcp_poll_interval, args.process_interval)) or not 0 <= args.cpu_quota <= 100:
         parser.error('intervals must be 2..300 and CPU quota 0..100')
     services = [('sing-box', '/etc/sing-box/config.json'), ('sing-box-cn', '/etc/sing-box-cn/config.json')]
@@ -89,9 +89,9 @@ def main():
     old_config = json.loads(config_path.read_text()) if config_path.exists() else {}
     config = {'listen': args.listen, 'scrape_token': old_config.get('scrape_token', secrets.token_urlsafe(32)),
               'tls_cert': str(ROOT / 'server.crt'), 'tls_key': str(ROOT / 'server.key'),
-              'poll_interval': args.poll_interval, 'source_mode': args.source_mode, 'max_sources': args.max_sources,
+              'poll_interval': args.poll_interval, 'source_mode': args.source_mode, 'source_idle_ttl': args.source_idle_ttl,
               'tcp_rtt': args.tcp_rtt, 'tcp_poll_interval': args.tcp_poll_interval, 'process_interval': args.process_interval,
-              'max_connections': 4096, 'source_state': str(STATE / 'source-slots.json'), 'services': []}
+              'max_connections': 4096, 'services': []}
     if args.tcp_rtt:
         # Preflight before changing any proxy config; retain explicit budgets.
         inventory = [i for _, path in services if pathlib.Path(path).exists()
@@ -241,7 +241,7 @@ WantedBy=multi-user.target
     run('systemctl', 'restart', 'sing-box-exporter-access')
     run('systemctl', 'restart', 'sing-box-exporter')
     print(json.dumps({'services': [s['name'] for s in config['services']], 'listen': args.listen,
-                      'source_mode': args.source_mode, 'source_limit': args.max_sources,
+                      'source_mode': args.source_mode, 'source_ip_limit': None,
                       'poll_interval': args.poll_interval, 'cpu_quota': args.cpu_quota,
                       'tcp_rtt': args.tcp_rtt, 'tcp_poll_interval': args.tcp_poll_interval,
                       'backups': backups}))

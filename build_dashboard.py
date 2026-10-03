@@ -8,6 +8,22 @@ HOST = 'instance=~"$host",service=~"$service"'
 ROUTE = HOST + ',protocol=~"$protocol"'
 panels = []
 next_id = 0
+FLAGS = json.loads(pathlib.Path(__file__).with_name('flags.json').read_text(encoding='utf-8'))
+
+
+def enrich(expression):
+    info = 'max by(source_ip,country_code,asn,as_name)(source_ipinfo_info)'
+    # Explicit left join: missing/failed enrichment must not drop source rows.
+    return f'(({expression}) * on(source_ip) group_left(country_code,asn,as_name) {info}) or ignoring(country_code,asn,as_name) ({expression})'
+
+
+def country_flag(table):
+    table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Flag'), properties=[
+        dict(id='custom.width', value=32), dict(id='custom.minWidth', value=32),
+        dict(id='custom.cellOptions', value=dict(type='image', title='Country from IPinfo', alt='')),
+        dict(id='mappings', value=[dict(type='value', options={code: dict(text=uri) for code, uri in FLAGS.items()}),
+                                  dict(type='special', options=dict(match='null', result=dict(text=''))),
+                                  dict(type='regex', options=dict(pattern='.*', result=dict(text='')))])]))
 
 
 def panel(title, kind, x, y, w, h, expressions=None, unit='short', description='', **extra):
@@ -93,28 +109,42 @@ panel('Active routing paths', 'table', 0, 29, 16, 8,
       [(f'singbox_route_connections{{{ROUTE}}} > 0', '')], description='Protocol/inbound/network/egress intersections, not just separate filters.')
 panel('Configured protocol listeners', 'table', 16, 29, 8, 8,
       [(f'singbox_inbound_info{{{ROUTE}}}', '')], description='Inventory includes idle listeners. API collection health is shown above; inventory is not a synthetic connectivity probe.')
-row('Source clients · bounded labels', 37)
-source_panel = panel('Source connections', 'table', 0, 38, 12, 8,
-      [(f'sum by(instance,service,protocol,source_ip)(singbox_source_protocol_connections{{{ROUTE}}})', ''),
-       (f'sum by(instance,service,protocol,source_ip)(singbox_tcp_source_rtt_sum{{{ROUTE}}}) / sum by(instance,service,protocol,source_ip)(singbox_tcp_source_rtt_count{{{ROUTE}}})', '')],
-      description='Active routed sessions and socket-weighted mean physical TCP RTT by host/service/protocol/bounded source IP. TCP RTT is pooled across listeners of the same protocol; UDP/QUIC and idle/unsupported RTT are blank, not zero. Pre-auth TCP sockets can have RTT without a routed-session count. All three global filters apply. NAT/relay IPs are not individual users; maximum RTT remains in the latency chart.')
+row('Source clients', 37)
+source_panel = panel('Source connections', 'table', 0, 38, 19, 8,
+      [(enrich(f'sum by(instance,service,protocol,source_ip)(singbox_source_protocol_connections{{{ROUTE}}})'), ''),
+       (enrich(f'sum by(instance,service,protocol,source_ip)(singbox_tcp_source_rtt_sum{{{ROUTE}}}) / sum by(instance,service,protocol,source_ip)(singbox_tcp_source_rtt_count{{{ROUTE}}})'), '')],
+      description='Currently active routed sessions and socket-weighted mean physical TCP RTT by host/service/protocol/source IP, with no IP-count cap. Disconnected clients can remain in historical bandwidth charts but not this current-session table. Country flag and Organization (IPinfo as_name) come from optional central IPinfo Lite enrichment, cached for 7 days by default; missing attribution stays blank without dropping connections. Country describes the peer IP, not verified user residence. TCP RTT is pooled across listeners of the same protocol; UDP/QUIC and idle/unsupported RTT are blank, not zero. All three global filters apply. NAT/relay IPs are not individual users; maximum RTT remains in the latency chart.')
 source_panel['transformations'].insert(0, dict(id='merge', options={}))
 source_options = source_panel['transformations'][1]['options']
-source_options['renameByName'].update({'Value #A': 'Active', 'Value #B': 'Mean RTT'})
-source_options['indexByName'].update({'instance': 0, 'service': 1, 'protocol': 2, 'source_ip': 3, 'Value #A': 4, 'Value #B': 5})
+source_options['renameByName'].update({'country_code': 'Flag', 'as_name': 'Organization', 'Value #A': 'Active', 'Value #B': 'Mean RTT'})
+source_options['excludeByName'].update(asn=True)
+source_options['indexByName'].update({'instance': 0, 'service': 1, 'protocol': 2, 'country_code': 3, 'source_ip': 4, 'as_name': 5, 'Value #A': 6, 'Value #B': 7})
 source_panel['fieldConfig']['overrides'] = [dict(matcher=dict(id='byName', options=name), properties=[dict(id='custom.width', value=width)])
-    for name, width in {'Host': 45, 'Service': 95, 'Protocol': 105, 'Source IP': 140, 'Active': 75, 'Mean RTT': 85}.items()]
+    for name, width in {'Host': 45, 'Service': 95, 'Protocol': 105, 'Source IP': 140, 'Organization': 300, 'Active': 75, 'Mean RTT': 85}.items()]
+source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Organization'), properties=[dict(id='custom.wrapText', value=True)]))
 source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Mean RTT'), properties=[dict(id='unit', value='s'), dict(id='decimals', value=2)]))
-panel('Observed source bandwidth · sampled', 'timeseries', 12, 38, 12, 8,
-      [(f'topk(12,sum by(instance,source_ip,direction)(rate(singbox_source_observed_bytes_total{{{HOST}}}[$__rate_interval])))', '{{instance}} · {{source_ip}} · {{direction}}')], 'Bps',
-      description='Top sampled client sources. No connection IDs, domains, destination IPs or ephemeral ports are stored in Prometheus.')
-panel('Source active-connection bytes', 'table', 0, 46, 12, 8,
-      [(f'sum by(instance,source_ip,direction)(singbox_source_active_bytes{{{HOST}}})', '')], 'bytes',
-      description='Lifetime bytes of currently active connections; this is a gauge and can decrease when connections close.')
-panel('Source label budget', 'timeseries', 12, 46, 12, 8,
-      [('singbox_exporter_source_slots{instance=~"$host"}', '{{instance}} assigned'),
-       ('singbox_exporter_source_slots_limit{instance=~"$host"}', '{{instance}} limit')],
-      description='Default: 32 distinct IP labels per host, persisted permanently until explicitly reset. Further clients aggregate under other.')
+country_flag(source_panel)
+panel('Observed source bandwidth · sampled', 'timeseries', 12, 46, 12, 8,
+      [(f'sum by(instance,source_ip,direction)(rate(singbox_source_observed_bytes_total{{{HOST}}}[$__rate_interval]))', '{{instance}} · {{source_ip}} · {{direction}}')], 'Bps',
+      description='All sampled client sources over the selected time range, including disconnected clients. No source-IP count cap. No connection IDs, domains, destination IPs or ephemeral ports are stored in Prometheus.')
+source_bytes = panel('Source active-connection bytes', 'table', 0, 46, 12, 8,
+      [(enrich(f'sum by(instance,source_ip)(singbox_source_active_bytes{{{HOST},direction="upload"}})'), ''),
+       (enrich(f'sum by(instance,source_ip)(singbox_source_active_bytes{{{HOST},direction="download"}})'), '')], 'bytes',
+      description='One row per host/source IP, with Upload and Download columns. Lifetime bytes of currently active connections; these gauges can decrease when connections close. Upload is client to destination, Download is destination to client. The same IP on different hosts stays separate.')
+source_bytes['transformations'].insert(0, dict(id='merge', options={}))
+byte_options = source_bytes['transformations'][1]['options']
+byte_options['renameByName'].update({'country_code': 'Flag', 'Value #A': 'Upload', 'Value #B': 'Download'})
+byte_options['excludeByName'].update(asn=True, as_name=True, direction=True)
+byte_options['indexByName'] = dict(instance=0, country_code=1, source_ip=2, **{'Value #A': 3, 'Value #B': 4})
+source_bytes['options']['sortBy'] = [dict(displayName='Download', desc=True)]
+source_bytes['fieldConfig']['overrides'].extend([
+    dict(matcher=dict(id='byName', options=name), properties=[dict(id='custom.width', value=115)])
+    for name in ('Upload', 'Download')])
+country_flag(source_bytes)
+panel('Source IPs', 'timeseries', 19, 38, 5, 8,
+      [('singbox_exporter_source_ips_active{instance=~"$host"}', '{{instance}} active'),
+       ('singbox_exporter_source_ips_tracked{instance=~"$host"}', '{{instance}} tracked')],
+      description='No source-IP count limit or overflow bucket. Active counts distinct source labels in latest service snapshots; tracked includes inactive counters retained for one hour by default. Historical chart legends can include disconnected IPs.')
 row('Client transport latency · TCP', 54)
 panel('TCP RTT · socket-weighted mean', 'timeseries', 0, 55, 12, 8,
       [(f'sum by(instance,protocol)(singbox_tcp_rtt_snapshot_sum{{{ROUTE}}}) / sum by(instance,protocol)(singbox_tcp_rtt_snapshot_count{{{ROUTE}}})', '{{instance}} · {{protocol}}')], 's',
@@ -156,7 +186,7 @@ panel('Collection failures / API resets', 'timeseries', 8, 69, 8, 7,
        (f'increase(singbox_api_resets_total{{{HOST}}}[$__rate_interval])', '{{instance}} / {{service}} resets')])
 panel('Prometheus scrape samples', 'timeseries', 16, 69, 8, 7,
       [('scrape_samples_scraped{job="sing-box",instance=~"$host"}', '{{instance}}')],
-      description='Monitor series cost. Scrape intervals are configured per target; keep a bounded sample limit in Prometheus.')
+      description='Monitor series cost. Source scrape sample-count limits are disabled; growing distinct-IP history increases TSDB storage. Byte/time and host resource guards remain.')
 for item in panels[resource_start:]:
     item['gridPos']['y'] += 16
 
@@ -167,8 +197,8 @@ def variable(name, label, query):
                 multi=True, includeAll=True, allValue='.*', current=dict(text='All', value='$__all'), options=[])
 
 
-dashboard = dict(uid='sing-box-fleet', title='sing-box · Fleet & connections', tags=['sing-box', 'network', 'fleet'],
-    timezone='browser', schemaVersion=39, version=1, editable=True, refresh='10s',
+dashboard = dict(uid='sing-box-fleet', title='sing-box monitor', tags=['sing-box', 'network', 'fleet'],
+    timezone='browser', schemaVersion=39, version=1, editable=True, refresh='5s',
     time=dict(**{'from': 'now-1h', 'to': 'now'}), graphTooltip=1,
     links=[],
     templating=dict(list=[dict(name='datasource', label='Datasource', type='datasource', query='prometheus',

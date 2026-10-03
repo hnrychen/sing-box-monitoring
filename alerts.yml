@@ -23,13 +23,6 @@ groups:
           severity: warning
         annotations:
           summary: "TCP RTT diagnostics unavailable on {{ $labels.instance }}"
-      - alert: SingBoxSourceSlotsFull
-        expr: singbox_exporter_source_slots >= singbox_exporter_source_slots_limit
-        for: 10m
-        labels:
-          severity: info
-        annotations:
-          summary: "Source slots full on {{ $labels.instance }}; new clients aggregate as other"
       - alert: SingBoxExporterCertificateExpiring
         expr: singbox_exporter_certificate_expiry_timestamp_seconds - time() < 30 * 86400
         for: 1h
