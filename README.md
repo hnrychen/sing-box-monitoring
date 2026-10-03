@@ -1,8 +1,28 @@
 # sing-box monitoring
 
-A lightweight Prometheus exporter and portable Grafana dashboard for sing-box.
-Python standard library only. No custom sing-box build, pip dependencies, packet
-capture, eBPF, log scraping, database, or active background latency probes.
+[![Latest release](https://img.shields.io/github/v/release/hnrychen/sing-box-monitoring?sort=semver)](https://github.com/hnrychen/sing-box-monitoring/releases/latest)
+[![CI](https://github.com/hnrychen/sing-box-monitoring/actions/workflows/tests.yml/badge.svg)](https://github.com/hnrychen/sing-box-monitoring/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+A Prometheus exporter and portable Grafana dashboard for monitoring sing-box
+servers. It collects traffic, live sessions, routing, source-IP activity, and
+optional passive TCP round-trip time (RTT). The exporter uses Python's standard
+library and the sing-box Clash API; it does not require a custom sing-box build.
+
+**Latest release:** [download the dashboard JSON](https://github.com/hnrychen/sing-box-monitoring/releases/latest/download/dashboard.json)
+or browse the [release notes and source bundle](https://github.com/hnrychen/sing-box-monitoring/releases/latest).
+
+## Contents
+
+- [Features](#features)
+- [Requirements and compatibility](#requirements-and-compatibility)
+- [Quick start](#quick-start-native-exporter)
+- [Connect Prometheus and Grafana](#connect-prometheus-and-grafana)
+- [Manual and container deployment](#manual-and-container-deployment)
+- [Metric accuracy and privacy](#accuracy-and-metric-semantics)
+- [Operations and removal](#tests-and-operations)
+- [Optional IP enrichment](#optional-central-ipinfo-lookup)
+- [License and references](#license-and-upstream-references)
 
 ## Features
 
@@ -13,7 +33,8 @@ capture, eBPF, log scraping, database, or active background latency probes.
   Source connections retains a compact two-column layout and shows Protocol,
   activity and mean RTT together; maximum RTT remains in the latency chart.
 - Optional **central IPinfo Lite enrichment**: country flags before source IPs
-  in both tables, plus Organization (`as_name`) in Source connections. Proxy agents need no changes.
+  in both tables, plus Organization (`as_name`) in Source connections. Proxy
+  agents need no changes.
 - Native process CPU/RSS/uptime, exporter health/resources, authenticated HTTPS,
   CA-pinned scrapes, and optional alert rules.
 - Configurable sampling and resource limits per host. One exporter per server;
@@ -28,34 +49,42 @@ sing-box servers ─ authenticated loopback Clash API ─ exporters ─ HTTPS/Be
 
 ## Requirements and compatibility
 
-Exporter: Linux, Python 3.11+, sing-box built with Clash API, and access to the
-same network namespace for optional TCP RTT. API routing metrics work with any
-protocol that the installed sing-box version tracks; inventory is supplied in
-the exporter config, not limited to a hardcoded protocol list.
+| Component | Requirement |
+| --- | --- |
+| Exporter | Linux and Python 3.11 or newer |
+| sing-box | A build with the Clash API enabled; routing metrics cover protocols tracked by that version |
+| Native installer | Debian/Ubuntu-style system with systemd, `openssl`, and `nft` |
+| Passive TCP RTT | Linux SOCK_DIAG access in the same network namespace as the sockets |
 
-Native installer: Debian/Ubuntu-style Linux with systemd, `sing-box`, `openssl`,
-and `nft`. It supports a **single JSON configuration file per service**. Supply
-custom unit names and config paths explicitly. Multi-file/JSONC configurations,
-non-systemd hosts, containerized proxy cores, and other distributions should use
-the documented manual exporter configuration rather than pretending the native
-installer can safely discover every layout. Monitoring/firewall installer
-addresses currently use IPv4; TCP diagnostics support IPv4 and IPv6 clients.
+The native installer supports one JSON configuration file per service. For
+multi-file or JSONC configs, non-systemd systems, containerized sing-box, or
+other Linux distributions, use the manual exporter configuration. The installer
+currently configures monitoring/firewall addresses over IPv4; TCP diagnostics
+can report IPv4 and IPv6 clients.
 
-Tested with sing-box 1.14.2, Python 3.13, Debian 13, x86_64 and ARM64. No changes
-to proxy routing, users, certificates or protocol settings are required beyond
-enabling an authenticated loopback Clash API. First-time API changes briefly
-restart that proxy service; subsequent installs with unchanged APIs do not.
+Validated with sing-box 1.14.2, Python 3.13, Debian 13, x86_64, and ARM64. The
+only sing-box configuration change is enabling an authenticated loopback Clash
+API. The first install may briefly restart the proxy service to apply it; later
+installs do not restart it when the API is already configured.
 
 ## Quick start: native exporter
 
-Copy this repository to the server. Inspect its current proxy configuration,
-then substitute your actual monitoring and server IPs:
+Clone the repository on the monitored server. Review its current sing-box
+configuration, then substitute the monitoring server's reachable IP and this
+server's certificate IP:
 
 ```sh
+git clone https://github.com/hnrychen/sing-box-monitoring.git
+cd sing-box-monitoring
+
 sudo python3 install.py \
   --monitor-ip 192.0.2.20 --certificate-ip 192.0.2.10 \
   --source-mode subnet --tcp-rtt
 ```
+
+The example addresses are reserved for documentation; replace them before
+running the command. See [Connect Prometheus and Grafana](#connect-prometheus-and-grafana)
+to add the target and import the dashboard.
 
 The default service discovery checks active `sing-box` and `sing-box-cn` units.
 Custom names/paths do not require editing the source:
@@ -68,12 +97,12 @@ sudo python3 install.py \
   --source-mode subnet --tcp-rtt
 ```
 
-The examples use reserved documentation addresses, not real machines. The
-installer creates `/opt/sing-box-exporter/{exporter,tcpdiag}.py`, protected
-configuration/TLS files in `/etc/sing-box-exporter` and two enabled systemd units. Exporter port 9119 is
-allowed only from loopback and the monitoring IP using a dedicated nftables
-table; existing rules are not flushed. Existing stricter firewalls must also
-permit the monitoring source. It refuses an existing non-loopback Clash API.
+The installer places the exporter in `/opt/sing-box-exporter`, protected config
+and TLS files under `/etc/sing-box-exporter`, and creates enabled systemd units.
+Port 9119 is allowed from loopback and the configured monitoring IP through a
+dedicated nftables table; existing firewall rules are not flushed. Existing
+firewall policy must also permit the monitoring server. Installation stops for
+review if a Clash API is already listening beyond loopback.
 
 Choose sampling **per machine**, not globally:
 
@@ -99,6 +128,20 @@ does not recover sessions that start and finish between polls. RTT estimates
 only change when the kernel receives relevant TCP acknowledgments.
 
 ## Connect Prometheus and Grafana
+
+From the Prometheus host, verify the exporter endpoint using its pinned
+certificate and scrape token:
+
+```sh
+curl --fail --show-error \
+  --cacert /etc/prometheus/secrets/proxy-1.crt \
+  -H "Authorization: Bearer $(cat /etc/prometheus/secrets/proxy-1.token)" \
+  https://192.0.2.10:9119/metrics
+```
+
+Replace the example certificate, token, and target address with your configured
+paths and exporter IP. A successful response contains Prometheus text-format
+metrics, including `singbox_up`.
 
 1. Securely copy **only** `server.crt` and the scrape token from the exporter
    config to your monitoring server. Never transfer the TLS private key or proxy
@@ -165,7 +208,7 @@ when upgrading Grafana; it modifies the frontend template to load a separate,
 cache-versioned stylesheet. No client extension or external font CDN is needed
 after deployment. See `FLAG-FONT-LICENSE.md` for Twemoji/Mozilla/TalkJS attribution.
 
-## Manual / container deployment
+## Manual and container deployment
 
 For an existing Clash API or nonstandard layout, start from
 `config.example.json`. Set independent random scrape/API tokens, existing
