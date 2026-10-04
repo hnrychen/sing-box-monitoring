@@ -21,7 +21,10 @@ def decode(payload):
     local_port, peer_port = struct.unpack_from('!HH', payload, 4)
     result = dict(local_ip=address(family, payload[8:24]), peer_ip=address(family, payload[24:40]),
                   local_port=local_port, peer_port=peer_port,
-                  uid=struct.unpack_from('=I', payload, 64)[0])
+                  uid=struct.unpack_from('=I', payload, 64)[0],
+                  socket_cookie=struct.unpack_from('=II', payload, 44),
+                  receive_queue_bytes=struct.unpack_from('=I', payload, 56)[0],
+                  send_queue_bytes=struct.unpack_from('=I', payload, 60)[0])
     offset = 72
     while offset + 4 <= len(payload):
         length, kind = struct.unpack_from('=HH', payload, offset)
@@ -31,6 +34,11 @@ def decode(payload):
             rtt, variation = struct.unpack_from('=II', payload, offset + 4 + 68)
             result.update(rtt_seconds=rtt / 1_000_000, variation_seconds=variation / 1_000_000)
             result['ack_age_seconds'] = struct.unpack_from('=I', payload, offset + 4 + 56)[0] / 1000
+            # Length-gated Linux UAPI fields: older kernels omit, never fake zero.
+            for name, field_offset in (('send_mss_bytes', 16), ('cwnd_segments', 80),
+                                       ('total_retransmissions', 100), ('notsent_bytes', 144)):
+                if length >= 4 + field_offset + 4:
+                    result[name] = struct.unpack_from('=I', payload, offset + 4 + field_offset)[0]
         offset += (length + 3) & ~3
     return result
 

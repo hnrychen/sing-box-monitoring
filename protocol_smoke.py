@@ -66,7 +66,7 @@ def client_outbounds(server):
                     out['obfs'] = inbound['obfs']
             else:
                 continue
-            results.append(dict(protocol=kind, outbound=out))
+            results.append(dict(service=path.parent.name, inbound=inbound.get('tag', kind), protocol=kind, outbound=out))
     return results
 
 
@@ -74,6 +74,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--export', help='Produce test client settings on the target; contains credentials, use only a pipe')
     parser.add_argument('--hold', type=int, default=22)
+    parser.add_argument('--binary', default='sing-box')
+    parser.add_argument('--ip-target', action='store_true', help='Send only destination IP to proxy; validate server TLS domain sniffing')
     args = parser.parse_args()
     if args.export:
         print(json.dumps(client_outbounds(args.export)))
@@ -92,9 +94,9 @@ def main():
         path = pathlib.Path(directory) / 'client.json'
         path.write_text(json.dumps(config))
         os.chmod(path, 0o600)
-        subprocess.run(['sing-box', 'check', '-c', str(path)], check=True, capture_output=True)
+        subprocess.run([args.binary, 'check', '-c', str(path)], check=True, capture_output=True)
         with (pathlib.Path(directory) / 'client.log').open('w') as logfile:
-            process = subprocess.Popen(['sing-box', 'run', '-c', str(path)], stdout=logfile, stderr=subprocess.STDOUT)
+            process = subprocess.Popen([args.binary, 'run', '-c', str(path)], stdout=logfile, stderr=subprocess.STDOUT)
             sockets = []
             try:
                 time.sleep(1)
@@ -106,7 +108,8 @@ def main():
                     if sock.recv(2) != b'\x05\x00':
                         raise RuntimeError('SOCKS greeting failed')
                     domain = b'www.cloudflare.com'
-                    sock.sendall(b'\x05\x01\x00\x03' + bytes([len(domain)]) + domain + struct.pack('!H', 443))
+                    target = (b'\x01' + socket.inet_aton(socket.gethostbyname(domain.decode()))) if args.ip_target else (b'\x03' + bytes([len(domain)]) + domain)
+                    sock.sendall(b'\x05\x01\x00' + target + struct.pack('!H', 443))
                     reply = sock.recv(1024)
                     if len(reply) < 2 or reply[1] != 0:
                         raise RuntimeError('SOCKS connect failed')

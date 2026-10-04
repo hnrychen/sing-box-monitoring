@@ -4,6 +4,7 @@
   "tls_cert": "/etc/sing-box-exporter/server.crt",
   "tls_key": "/etc/sing-box-exporter/server.key",
   "source_mode": "off",
+  "connection_details": false,
   "source_idle_ttl": 3600,
   "max_connections": 4096,
   "poll_interval": 10,

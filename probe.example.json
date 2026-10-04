@@ -1,0 +1,25 @@
+{
+  "listen": "127.0.0.1:9122",
+  "vantage": "central",
+  "interval": 60,
+  "timeout": 8,
+  "workers": 2,
+  "client_port_base": 19360,
+  "state_file": "/var/lib/sing-box-probe/counters.json",
+  "runtime_dir": "/run/sing-box-probe",
+  "checks": [
+    {"name": "cloudflare", "url": "https://www.cloudflare.com/cdn-cgi/trace", "status": 200, "trace_ip": true}
+  ],
+  "targets": [
+    {
+      "id": "proxy-1-ss",
+      "instance": "proxy-1",
+      "service": "sing-box",
+      "protocol": "shadowsocks",
+      "outbound": {
+        "type": "shadowsocks", "server": "192.0.2.10", "server_port": 10443,
+        "method": "2022-blake3-aes-128-gcm", "password": "REPLACE_WITH_PRIVATE_CREDENTIAL"
+      }
+    }
+  ]
+}

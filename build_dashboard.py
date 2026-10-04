@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a portable Grafana dashboard. Uses only the built-in Prometheus plugin."""
+"""Generate a portable Grafana dashboard; optional live JSON uses Infinity."""
 import json
 import pathlib
 
@@ -8,22 +8,13 @@ HOST = 'instance=~"$host",service=~"$service"'
 ROUTE = HOST + ',protocol=~"$protocol"'
 panels = []
 next_id = 0
-FLAGS = json.loads(pathlib.Path(__file__).with_name('flags.json').read_text(encoding='utf-8'))
+INFO_QUERY = 'max by(source_ip,country_code,asn,as_name,source_ip_display)(source_ipinfo_info{source_ip_display!=""})'
 
 
 def enrich(expression):
-    info = 'max by(source_ip,country_code,asn,as_name)(source_ipinfo_info)'
     # Explicit left join: missing/failed enrichment must not drop source rows.
-    return f'(({expression}) * on(source_ip) group_left(country_code,asn,as_name) {info}) or ignoring(country_code,asn,as_name) ({expression})'
-
-
-def country_flag(table):
-    table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Flag'), properties=[
-        dict(id='custom.width', value=32), dict(id='custom.minWidth', value=32),
-        dict(id='custom.cellOptions', value=dict(type='image', title='Country from IPinfo', alt='')),
-        dict(id='mappings', value=[dict(type='value', options={code: dict(text=uri) for code, uri in FLAGS.items()}),
-                                  dict(type='special', options=dict(match='null', result=dict(text=''))),
-                                  dict(type='regex', options=dict(pattern='.*', result=dict(text='')))])]))
+    fallback = f'label_replace(({expression}), "source_ip_display", "$1", "source_ip", "(.*)")'
+    return f'(({expression}) * on(source_ip) group_left(country_code,asn,as_name,source_ip_display) {INFO_QUERY}) or ignoring(country_code,asn,as_name,source_ip_display) ({fallback})'
 
 
 def panel(title, kind, x, y, w, h, expressions=None, unit='short', description='', **extra):
@@ -116,14 +107,13 @@ source_panel = panel('Source connections', 'table', 0, 38, 19, 8,
       description='Currently active routed sessions and socket-weighted mean physical TCP RTT by host/service/protocol/source IP, with no IP-count cap. Disconnected clients can remain in historical bandwidth charts but not this current-session table. Country flag and Organization (IPinfo as_name) come from optional central IPinfo Lite enrichment, cached for 7 days by default; missing attribution stays blank without dropping connections. Country describes the peer IP, not verified user residence. TCP RTT is pooled across listeners of the same protocol; UDP/QUIC and idle/unsupported RTT are blank, not zero. All three global filters apply. NAT/relay IPs are not individual users; maximum RTT remains in the latency chart.')
 source_panel['transformations'].insert(0, dict(id='merge', options={}))
 source_options = source_panel['transformations'][1]['options']
-source_options['renameByName'].update({'country_code': 'Flag', 'as_name': 'Organization', 'Value #A': 'Active', 'Value #B': 'Mean RTT'})
-source_options['excludeByName'].update(asn=True)
-source_options['indexByName'].update({'instance': 0, 'service': 1, 'protocol': 2, 'country_code': 3, 'source_ip': 4, 'as_name': 5, 'Value #A': 6, 'Value #B': 7})
+source_options['renameByName'].update({'source_ip_display': 'Source IP', 'as_name': 'Organization', 'Value #A': 'Active', 'Value #B': 'Mean RTT'})
+source_options['excludeByName'].update(asn=True, country_code=True, source_ip=True)
+source_options['indexByName'] = {'instance': 0, 'service': 1, 'protocol': 2, 'source_ip_display': 3, 'as_name': 4, 'Value #A': 5, 'Value #B': 6}
 source_panel['fieldConfig']['overrides'] = [dict(matcher=dict(id='byName', options=name), properties=[dict(id='custom.width', value=width)])
-    for name, width in {'Host': 45, 'Service': 95, 'Protocol': 105, 'Source IP': 140, 'Organization': 300, 'Active': 75, 'Mean RTT': 85}.items()]
+    for name, width in {'Host': 45, 'Service': 95, 'Protocol': 105, 'Source IP': 165, 'Organization': 300, 'Active': 75, 'Mean RTT': 85}.items()]
 source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Organization'), properties=[dict(id='custom.wrapText', value=True)]))
 source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Mean RTT'), properties=[dict(id='unit', value='s'), dict(id='decimals', value=2)]))
-country_flag(source_panel)
 panel('Observed source bandwidth · sampled', 'timeseries', 12, 46, 12, 8,
       [(f'sum by(instance,source_ip,direction)(rate(singbox_source_observed_bytes_total{{{HOST}}}[$__rate_interval]))', '{{instance}} · {{source_ip}} · {{direction}}')], 'Bps',
       description='All sampled client sources over the selected time range, including disconnected clients. No source-IP count cap. No connection IDs, domains, destination IPs or ephemeral ports are stored in Prometheus.')
@@ -133,14 +123,13 @@ source_bytes = panel('Source active-connection bytes', 'table', 0, 46, 12, 8,
       description='One row per host/source IP, with Upload and Download columns. Lifetime bytes of currently active connections; these gauges can decrease when connections close. Upload is client to destination, Download is destination to client. The same IP on different hosts stays separate.')
 source_bytes['transformations'].insert(0, dict(id='merge', options={}))
 byte_options = source_bytes['transformations'][1]['options']
-byte_options['renameByName'].update({'country_code': 'Flag', 'Value #A': 'Upload', 'Value #B': 'Download'})
-byte_options['excludeByName'].update(asn=True, as_name=True, direction=True)
-byte_options['indexByName'] = dict(instance=0, country_code=1, source_ip=2, **{'Value #A': 3, 'Value #B': 4})
+byte_options['renameByName'].update({'source_ip_display': 'Source IP', 'Value #A': 'Upload', 'Value #B': 'Download'})
+byte_options['excludeByName'].update(asn=True, as_name=True, direction=True, country_code=True, source_ip=True)
+byte_options['indexByName'] = dict(instance=0, source_ip_display=1, **{'Value #A': 2, 'Value #B': 3})
 source_bytes['options']['sortBy'] = [dict(displayName='Download', desc=True)]
 source_bytes['fieldConfig']['overrides'].extend([
     dict(matcher=dict(id='byName', options=name), properties=[dict(id='custom.width', value=115)])
     for name in ('Upload', 'Download')])
-country_flag(source_bytes)
 panel('Source IPs', 'timeseries', 19, 38, 5, 8,
       [('singbox_exporter_source_ips_active{instance=~"$host"}', '{{instance}} active'),
        ('singbox_exporter_source_ips_tracked{instance=~"$host"}', '{{instance}} tracked')],
@@ -188,7 +177,138 @@ panel('Prometheus scrape samples', 'timeseries', 16, 69, 8, 7,
       [('scrape_samples_scraped{job="sing-box",instance=~"$host"}', '{{instance}}')],
       description='Monitor series cost. Source scrape sample-count limits are disabled; growing distinct-IP history increases TSDB storage. Byte/time and host resource guards remain.')
 for item in panels[resource_start:]:
-    item['gridPos']['y'] += 16
+    item['gridPos']['y'] += 27
+
+# Live JSON is separate from Prometheus: no destination/connection-ID series.
+live_start = len(panels)
+live_row = row('Active connection destinations', 70)
+live_row['id'] = 900
+live_table = panel('Live destinations', 'table', 0, 71, 24, 10, description=
+    'Current routed TCP/UDP sessions, grouped by host/service/source/protocol/network/domain/destination/egress. '
+    'Domain is best effort from client metadata or HTTP/TLS/QUIC sniffing; blank means unknown. '
+    'Upload/Download are lifetime bytes of currently active sessions; Oldest is their maximum age. '
+    'All global filters apply. This view ignores the historical time range and refreshes every 5s from cached snapshots. '
+    'Short-lived sessions between polls can be missed; UDP destinations describe tracked session metadata. '
+    'Unavailable collectors raise a query error instead of showing stale destinations. No history or destination metric labels.')
+live_table['id'] = 901
+live_ds = dict(type='yesoreyeram-infinity-datasource', uid='sing-box-connections')
+live_table['datasource'] = live_ds
+columns = [('host', 'Host', 'string'), ('service', 'Service', 'string'), ('source_ip_display', 'Source IP', 'string'),
+           ('protocol', 'Protocol', 'string'), ('network', 'Network', 'string'), ('domain', 'Domain', 'string'),
+           ('destination', 'Destination', 'string'), ('active', 'Active', 'number'),
+           ('upload_bytes', 'Upload', 'number'), ('download_bytes', 'Download', 'number'),
+           ('age_seconds', 'Oldest', 'number'), ('outbound', 'Egress', 'string')]
+live_table['targets'] = [dict(refId='A', datasource=live_ds, type='json', source='url', parser='backend',
+    format='table', url='/connections?${host:queryparam}&${service:queryparam}&${protocol:queryparam}',
+    url_options=dict(method='GET'), root_selector='rows',
+    columns=[dict(selector=key, text=title, type=kind) for key, title, kind in columns])]
+live_table['transformations'] = [dict(id='organize', options=dict(indexByName={title: i for i, (_, title, _) in enumerate(columns)}))]
+live_table['options']['sortBy'] = [dict(displayName='Download', desc=True)]
+live_table['fieldConfig']['defaults']['custom'].update(filterable=False)
+live_table['fieldConfig']['overrides'] = [dict(matcher=dict(id='byName', options=name),
+    properties=[dict(id='custom.width', value=width)]) for name, width in
+    {'Host': 70, 'Service': 105, 'Source IP': 165, 'Protocol': 110, 'Network': 75, 'Domain': 215,
+     'Destination': 185, 'Active': 65, 'Upload': 100, 'Download': 100, 'Oldest': 85, 'Egress': 110}.items()]
+for name in ('Source IP', 'Domain', 'Destination'):
+    live_table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options=name),
+        properties=[dict(id='custom.filterable', value=True)]))
+live_table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Domain'),
+    properties=[dict(id='custom.wrapText', value=True)]))
+for name, unit in [('Upload', 'bytes'), ('Download', 'bytes'), ('Oldest', 's')]:
+    live_table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options=name),
+        properties=[dict(id='unit', value=unit), dict(id='decimals', value=2)]))
+panels[resource_start:resource_start] = panels[live_start:]
+del panels[live_start + 2:]
+
+# Reuse existing counters for an instant operational summary, not extra polling.
+activity = panel('Service activity', 'table', 0, 5, 8, 7,
+    [(f'max by(instance,service)(singbox_connections{{{HOST}}})', ''),
+     (f'sum by(instance,service)(rate(singbox_traffic_bytes_total{{{HOST},direction="upload"}}[$__rate_interval]))', ''),
+     (f'sum by(instance,service)(rate(singbox_traffic_bytes_total{{{HOST},direction="download"}}[$__rate_interval]))', ''),
+     (f'max by(instance,service)(singbox_process_uptime_seconds{{{HOST}}})', '')],
+    description='One row per host/service at the selected dashboard end time. Active is current routed sessions; Upload/Download are exact payload counter rates averaged over $__rate_interval. Uptime is process age. Host and Service filters apply; protocol filter does not, matching fleet totals. Failed API snapshots omit traffic/connection values rather than reporting zero; missing values stay blank. This is activity, not an end-to-end connectivity test.')
+activity['id'] = 902
+activity['transformations'] = [dict(id='merge', options={}), dict(id='organize', options=dict(
+    excludeByName={'Time': True, '__name__': True, 'job': True},
+    indexByName={'instance': 0, 'service': 1, 'Value #A': 2, 'Value #B': 3, 'Value #C': 4, 'Value #D': 5},
+    renameByName={'instance': 'Host', 'service': 'Service', 'Value #A': 'Active',
+                  'Value #B': 'Upload', 'Value #C': 'Download', 'Value #D': 'Uptime'}))]
+activity['options']['sortBy'] = [dict(displayName='Active', desc=True)]
+activity['fieldConfig']['overrides'] = [dict(matcher=dict(id='byName', options=name),
+    properties=[dict(id='custom.width', value=width), dict(id='unit', value=unit), dict(id='decimals', value=decimals)])
+    for name, width, unit, decimals in [('Host', 60, 'none', 0), ('Service', 100, 'none', 0),
+        ('Active', 80, 'short', 0), ('Upload', 85, 'Bps', 1), ('Download', 100, 'Bps', 1), ('Uptime', 85, 's', 1)]]
+panels.pop()  # update_layout inserts the table at the original overview slot.
+from dashboard_layout import update_layout
+panels = update_layout(dict(panels=panels), activity)['panels']
+
+# Optional central probes and passive TCP diagnostics; no new core polling.
+network_start = len(panels)
+probe_row = row('End-to-end proxy checks', 0)
+probe_row['id'] = 1000
+probe_table = panel('Latest proxy checks', 'table', 0, 1, 24, 10,
+    description='One row per host/protocol, with separate Cloudflare and ChatGPT results. Host/Service/Protocol filters apply before grouping. For multiple selected listeners/vantages, status is their worst result, time is their slowest successful request, and age is the oldest result. Any stale/pending contributor makes that endpoint unavailable; failed endpoints omit successful-response time. HTTP is blank for mixed codes. Runs every 60s centrally, independently of Grafana refresh. Proves the configured HTTPS paths, not every destination, browser login or arbitrary UDP applications. Not client TCP/QUIC RTT.')
+probe_table['id'] = 1001
+probe_expressions = []
+probe_columns = [('instance', 'Host', 70, 'none', 0), ('protocol', 'Protocol', 110, 'none', 0)]
+for check, title in [('cloudflare', 'Cloudflare'), ('chatgpt', 'ChatGPT')]:
+    selector = f'{ROUTE},probe="{check}"'
+    fresh = f'(min by(instance,protocol)(singbox_probe_result_fresh{{{selector}}}) == 1)'
+    passed = f'(min by(instance,protocol)(singbox_probe_success{{{selector}}}) == 1)'
+    probe_expressions.extend([
+        f'min by(instance,protocol)(singbox_probe_success{{{selector}}}) and on(instance,protocol) {fresh}',
+        f'max by(instance,protocol)(singbox_probe_duration_seconds{{{selector}}}) and on(instance,protocol) {passed} and on(instance,protocol) {fresh}',
+        f'(min by(instance,protocol)(singbox_probe_http_status_code{{{selector}}}) == on(instance,protocol) max by(instance,protocol)(singbox_probe_http_status_code{{{selector}}})) and on(instance,protocol) {fresh}',
+        f'time()-min by(instance,protocol)(singbox_probe_last_run_timestamp_seconds{{{selector}}})'])
+    for label, width, unit, decimals in [(title, 95, 'short', 0), (title + ' time', 140, 's', 2),
+                                        (title + ' HTTP', 125, 'none', 0), (title + ' age', 115, 's', 1)]:
+        ref = chr(ord('A') + len(probe_columns) - 2)
+        probe_columns.append(('Value #' + ref, label, width, unit, decimals))
+# Keep pending/stale configured rows visible, without treating missing as success.
+probe_expressions.append(f'min by(instance,protocol)(singbox_probe_result_fresh{{{ROUTE},probe=~"cloudflare|chatgpt"}})')
+probe_table['targets'] = [dict(refId=chr(ord('A') + i), expr=expr, legendFormat='',
+    instant=True, range=False, format='table', datasource=DS) for i, expr in enumerate(probe_expressions)]
+probe_table['transformations'] = [dict(id='merge', options={}), dict(id='organize', options=dict(
+    excludeByName={'Time': True, '__name__': True, 'job': True, 'Value #I': True},
+    indexByName={field: i for i, (field, *_) in enumerate(probe_columns)},
+    renameByName={field: label for field, label, *_ in probe_columns}))]
+probe_table['options']['sortBy'] = [dict(displayName='Cloudflare', desc=False), dict(displayName='ChatGPT', desc=False)]
+probe_table['fieldConfig']['overrides'] = [dict(matcher=dict(id='byName', options=name),
+    properties=[dict(id='custom.width', value=width), dict(id='unit', value=unit), dict(id='decimals', value=decimals)])
+    for _, name, width, unit, decimals in probe_columns]
+for name in ('Cloudflare', 'ChatGPT'):
+    probe_table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options=name), properties=[
+        dict(id='mappings', value=[dict(type='value', options={'0': dict(text='Failed', color='red'), '1': dict(text='OK', color='green')}),
+                                 dict(type='special', options=dict(match='null', result=dict(text='Unavailable', color='gray')))]),
+        dict(id='noValue', value='Unavailable'), dict(id='custom.cellOptions', value=dict(type='color-text'))]))
+success = panel('End-to-end proxy success', 'timeseries', 0, 11, 12, 8,
+    [(f'singbox_probe_success{{{ROUTE}}}', '{{instance}} · {{protocol}} · {{probe}}')],
+    description='Latest scheduled HTTP check: 1 passed, 0 failed. Freshness gaps mean unavailable results, not successful checks. Each result may repeat over multiple scrapes; not a per-request success ratio.',
+    fieldConfig=dict(defaults=dict(unit='short', min=0, max=1,
+        custom=dict(drawStyle='line', lineInterpolation='stepAfter', spanNulls=False, fillOpacity=8)), overrides=[]))
+success['id'] = 1002
+response = panel('End-to-end HTTPS response time', 'timeseries', 12, 11, 12, 8,
+    [(f'singbox_probe_duration_seconds{{{ROUTE}}}', '{{instance}} · {{protocol}} · {{probe}}')], 's',
+    description='Successful curl request duration through a real proxy client, including connection setup, DNS on the configured proxy path, TLS and the small HTTPS response. Central client process startup is excluded. Failed attempts have no successful-response duration; see success/HTTP/Age. Not client transport RTT or a browser/application benchmark.')
+response['id'] = 1003
+retrans = panel('TCP retransmissions · observed rate', 'timeseries', 0, 0, 8, 7,
+    [(f'sum by(instance,protocol)(rate(singbox_tcp_observed_retransmissions_total{{{ROUTE}}}[$__rate_interval]))', '{{instance}} · {{protocol}}')], 'suffix: retrans/s',
+    description='Passive retransmission increments for client-facing established TCP sockets seen in consecutive snapshots. First observation is baseline; short-lived sockets and bytes/events after the last sample can be missed. Not a packet-loss percentage or exact lifetime count. No UDP/QUIC coverage.')
+retrans['id'] = 1004
+cwnd = panel('TCP congestion window · per-socket mean', 'timeseries', 8, 0, 8, 7,
+    [(f'sum by(instance,protocol)(singbox_tcp_cwnd_bytes_sum{{{ROUTE}}}) / sum by(instance,protocol)(singbox_tcp_cwnd_socket_count{{{ROUTE}}})', '{{instance}} · {{protocol}}')], 'bytes',
+    description='Mean server send congestion window across CURRENT supported physical TCP sockets: Linux cwnd segments × send MSS. Includes idle/pre-authentication sockets. Capacity, not queued traffic, throughput or available bandwidth. Empty/unsupported is blank, not zero.')
+cwnd['id'] = 1005
+pending = panel('TCP pending bytes', 'timeseries', 16, 0, 8, 7,
+    [(f'sum by(instance,protocol)(singbox_tcp_send_queue_bytes{{{ROUTE}}})', '{{instance}} · {{protocol}} send queue'),
+     (f'sum by(instance,protocol)(singbox_tcp_receive_queue_bytes{{{ROUTE}}})', '{{instance}} · {{protocol}} receive queue'),
+     (f'sum by(instance,protocol)(singbox_tcp_notsent_bytes{{{ROUTE}}})', '{{instance}} · {{protocol}} unsent')], 'bytes',
+    description='Current client-facing established TCP queues from Linux SOCK_DIAG. Send queue includes unacknowledged + unsent bytes; unsent is a SUBSET, do not add them. Receive queue waits for sing-box to read. Server perspective, includes idle sockets. Optional unsent fields are omitted on unsupported kernels.')
+pending['id'] = 1006
+network_templates = panels[network_start:]
+del panels[network_start:]
+from network_layout import update_network_layout
+panels = update_network_layout(dict(panels=panels), network_templates)['panels']
 
 
 def variable(name, label, query):

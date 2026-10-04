@@ -45,6 +45,11 @@ def metadata(address, data):
     return dict(country_code=country, asn=asn, as_name=''.join(c for c in name[:120] if c.isprintable()))
 
 
+def source_display(address, country):
+    flag = ''.join(chr(0x1F1E6 + ord(c) - ord('A')) for c in country) if re.fullmatch('[A-Z]{2}', country) else ''
+    return (flag + ' ' if flag else '') + address
+
+
 class Enrichment:
     def __init__(self, config):
         self.config = config
@@ -182,7 +187,7 @@ class Enrichment:
                 entry = self.cache.get(address, {})
                 if entry.get('data') is None or now - entry.get('checked', 0) > 2592000:
                     continue  # Never retain attribution indefinitely after API failure.
-                metric('info', 1, dict(source_ip=address, **entry['data']))
+                metric('info', 1, dict(source_ip=address, source_ip_display=source_display(address, entry['data']['country_code']), **entry['data']))
                 metric('lookup_timestamp_seconds', entry['checked'], dict(source_ip=address))
         return ('\n'.join(lines) + '\n').encode()
 

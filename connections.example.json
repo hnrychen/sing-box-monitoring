@@ -1,0 +1,12 @@
+{
+  "listen": "127.0.0.1:9121",
+  "ipinfo_metrics_url": "http://127.0.0.1:9120/metrics",
+  "sources": [
+    {
+      "host": "proxy-1",
+      "url": "https://192.0.2.10:9119",
+      "ca_file": "/etc/prometheus/secrets/proxy-1.crt",
+      "token_file": "/etc/prometheus/secrets/proxy-1.token"
+    }
+  ]
+}

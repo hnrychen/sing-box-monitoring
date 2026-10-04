@@ -19,6 +19,7 @@ or browse the [release notes and source bundle](https://github.com/hnrychen/sing
 - [Quick start](#quick-start-native-exporter)
 - [Connect Prometheus and Grafana](#connect-prometheus-and-grafana)
 - [Manual and container deployment](#manual-and-container-deployment)
+- [Unified operations guide](OPERATIONS.md)
 - [Metric accuracy and privacy](#accuracy-and-metric-semantics)
 - [Operations and removal](#tests-and-operations)
 - [Optional IP enrichment](#optional-central-ipinfo-lookup)
@@ -26,6 +27,12 @@ or browse the [release notes and source bundle](https://github.com/hnrychen/sing
 
 ## Features
 
+- Optional central end-to-end HTTPS checks through real proxy clients, with
+  success history, response-time charts and an operational results table.
+- Passive TCP retransmission increments, congestion-window and pending-byte
+  diagnostics using the existing socket poll, with no packet capture.
+- [Unified native deployment and management](OPERATIONS.md) of exporter,
+  IPinfo, live connections and probes through `sing-box-monitor`.
 - Fleet traffic and availability, inbound protocol inventory, live connections,
   TCP/UDP session breakdowns, egress routing, and individual source-IP activity.
 - Passive client-facing **TCP RTT**: socket-weighted mean, current-socket p95,
@@ -39,8 +46,11 @@ or browse the [release notes and source bundle](https://github.com/hnrychen/sing
   CA-pinned scrapes, and optional alert rules.
 - Configurable sampling and resource limits per host. One exporter per server;
   central Prometheus/Grafana rather than a monitoring stack on each small VPS.
-- A built-in-plugin-only Grafana dashboard with host, service, and protocol
-  filters. No fixed machines, addresses, datasource UID, or external dashboard ID.
+- A Grafana dashboard with host, service, and protocol filters. Core metric
+  panels use built-in datasources and contain no fixed machines or addresses.
+- Optional live destination table using Grafana Infinity: best-effort domain,
+  destination IP/port, source, protocol, active count, bytes and age. Detailed
+  records stay outside Prometheus and are not retained as browsing history.
 
 ```text
 sing-box servers ─ authenticated loopback Clash API ─ exporters ─ HTTPS/Bearer ─ Prometheus ─ Grafana
@@ -166,6 +176,11 @@ GRAFANA_URL=http://127.0.0.1:3000 GRAFANA_USER=YOUR_USER \
 keys. It resolves the actual Prometheus datasource automatically. Subsequent
 imports overwrite only dashboard UID `sing-box-fleet`; export/review live edits
 first. Anonymous access/public dashboard sharing is never enabled automatically.
+
+Fleet overview includes a per-service activity table (active sessions, payload
+upload/download rates and uptime), using existing metrics without extra polling.
+Service and TCP collector availability graphs are grouped in the resource/health
+section. Host/Service filters apply to service totals; protocol filtering does not.
 
 `build_dashboard.py` regenerates the portable dashboard. It includes no fixed
 links to dashboards that might not exist on someone else's Grafana.
@@ -327,6 +342,55 @@ Native default limits include 64 MiB memory, 16 tasks and 128 FDs, with configur
 CPU quota. Increasing inventory/cardinality requires reviewing Prometheus sample
 limits and collector budgets. Resource usage is workload-dependent, not guaranteed.
 
+## Optional live destination table
+
+The dashboard includes a **Live destinations** table between TCP latency and
+service resources. It requires the signed `yesoreyeram-infinity-datasource`
+plugin (tested with 4.0.0) and the optional central `connections_view.py` worker.
+For metric-only installations, remove panels 900/901; no Infinity plugin is then
+needed. The live view ignores the historical time range, uses the same global
+selectors, and refreshes every 5s. Rows group source and destination; byte totals
+belong only to currently active sessions and can decrease when sessions close.
+
+1. Opt each exporter into `install.py --connection-details`, or set
+   `"connection_details": true` in its current config and restart the exporter.
+   Authenticated HTTPS `/connections` reuses cached API snapshots and the same
+   source privacy mode. No additional core polling or Prometheus labels are added.
+2. On the monitoring machine, edit `connections.example.json` with each exporter's
+   host label, HTTPS URL, pinned CA file and bearer token file. Bind the worker to
+   loopback or an explicitly selected private Docker gateway reachable by Grafana.
+   Run `sudo python3 install_connections.py --config-stdin < connections.example.json`.
+3. Install Infinity in Grafana and restart it. Supply Grafana credentials as JSON
+   on stdin to `sudo python3 publish_connections.py --credentials-stdin
+   --bridge-url http://PRIVATE_BIND_IP:9121`. This creates the private datasource
+   with UID `sing-box-connections` and inserts only the new section into the
+   current dashboard, backing it up first. Tokens stay in secure datasource fields.
+
+The central worker uses Python's standard library, fetches exporter caches in
+parallel, shares a two-second cache across viewers and stores no history. Failed
+or stale selected collectors raise a visible query error. Sessions closed between
+polls can be missed; UDP rows describe tracked sessions, not packet-level targets.
+Unknown domains stay blank. A destination IP alone is not a unique website identity.
+Optional `ipinfo_metrics_url` reads the existing local IPinfo worker's `/metrics`
+cache to prefix Source IP with a country flag. It adds no external lookups and
+does not change raw IP identities; unavailable metadata leaves a plain IP.
+Omit this setting if the IPinfo worker is not installed. Windows needs a flag-capable
+font, such as the optional self-hosted country font described above.
+
+Domains may come directly from the client. Optional server HTTP/TLS/QUIC sniffing
+can discover additional names, using
+`sudo python3 enable_domain_sniffing.py --service UNIT=/absolute/config.json`.
+The helper validates, backs up and preserves existing rules, using a 100ms timeout
+when it adds a rule. Sniffing can affect existing domain-based routing, and adds
+connection setup work: review rules and measure CPU first on restricted hosts.
+HTTPS URL paths and content stay encrypted; ECH can hide the actual SNI hostname.
+
+Remove the feature by deleting panels 900/901 and datasource `sing-box-connections`,
+stopping/disabling the central service, and disabling `connection_details` on
+exporters. Keep backups for rollback as needed. Run `python3 -m unittest -v
+test_connections` to check grouping, privacy, staleness, session removal and
+idempotent dashboard/sniff updates.
+
 ## Tests and operations
 
 ```sh
@@ -417,13 +481,14 @@ ASN remains available in metadata, but hidden from the table.
 Attribution changes can create new metadata time series; cache cardinality
 is time-managed, while historical series remain until Prometheus retention removes them.
 
-Flag icons are tiny PNGs bundled into the dashboard's value mappings, with no
-browser network requests or reliance on platform emoji fonts. `flags.json` and
-`FLAGS-LICENSE.txt` must accompany `build_dashboard.py`; ordinary builds use the
-committed bundle and need no network/browser dependencies. To regenerate assets,
-run `fetch_flags.py` (pinned flag-icons source), then `bundle_flags.cjs` with an
-installed Playwright and Edge (or override `FLAG_BROWSER_CHANNEL`). Flag-icons
-is MIT licensed; retain `FLAGS-LICENSE.txt`. The core remains dependency-free.
+Both source tables prefix Source IP with small country-flag emoji instead of a
+separate image column. The central metadata metric's `source_ip_display` label
+is joined only for presentation; raw `source_ip` and agent measurements remain
+unchanged. Missing metadata falls back to a plain IP without dropping rows.
+There are no additional API lookups or metric series per IP. On Windows, install
+the optional self-hosted flag font described above. Existing metric-only Grafana
+installations can update only these tables using `publish_source_tables.py
+--credentials-stdin`; current dashboard backups are saved before changes.
 
 Run `python3 -m unittest -v test_ipinfo` for cache/privacy/failure tests, and
 `python3 verify_ipinfo.py` on the central host for real PromQL join/fallback

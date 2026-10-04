@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import urllib.error
 from unittest.mock import patch
-from ipinfo_exporter import Enrichment, metadata, public_ip
+from ipinfo_exporter import Enrichment, metadata, public_ip, source_display
 
 
 class IpinfoTests(unittest.TestCase):
@@ -125,7 +125,6 @@ class IpinfoTests(unittest.TestCase):
                 Enrichment(dict(self.config, **settings))
 
     def test_flags_and_table_policy(self):
-        import base64
         from build_dashboard import dashboard
         self.assertEqual(dashboard['title'], 'sing-box monitor')
         self.assertEqual(dashboard['refresh'], '5s')
@@ -134,21 +133,56 @@ class IpinfoTests(unittest.TestCase):
         for table in tables:
             self.assertEqual(table['gridPos']['w'], 19 if table['title'] == 'Source connections' else 12)
             options = table['transformations'][-1]['options']
-            self.assertLess(options['indexByName']['country_code'], options['indexByName']['source_ip'])
-            field = next(o for o in table['fieldConfig']['overrides'] if o['matcher']['options'] == 'Flag')
-            mappings = next(p['value'] for p in field['properties'] if p['id'] == 'mappings')[0]['options']
-            for code in ('HK', 'CN', 'US', 'SG'):
-                self.assertTrue(base64.b64decode(mappings[code]['text'].split(',', 1)[1]).startswith(b'\x89PNG\r\n\x1a\n'))
+            self.assertEqual(options['renameByName']['source_ip_display'], 'Source IP')
+            self.assertTrue(options['excludeByName']['country_code'])
+            self.assertTrue(options['excludeByName']['source_ip'])
+            self.assertFalse(any(o['matcher']['options'] == 'Flag' for o in table['fieldConfig']['overrides']))
+            self.assertNotIn('data:image/png', json.dumps(table))
+            for target in table['targets']:
+                self.assertIn('source_ip_display', target['expr'])
+                self.assertIn('label_replace', target['expr'])
         connections = next(p for p in tables if p['title'] == 'Source connections')
         options = connections['transformations'][-1]['options']
         self.assertEqual(options['renameByName']['as_name'], 'Organization')
         self.assertTrue(options['excludeByName']['asn'])
         budget = next(p for p in dashboard['panels'] if p['title'] == 'Source IPs')
         bandwidth = next(p for p in dashboard['panels'] if p['title'] == 'Observed source bandwidth · sampled')
-        self.assertEqual(budget['gridPos'], dict(x=19, y=38, w=5, h=8))
-        self.assertEqual(bandwidth['gridPos'], dict(x=12, y=46, w=12, h=8))
+        self.assertEqual(budget['gridPos'], dict(x=19, y=connections['gridPos']['y'], w=5, h=8))
+        byte_table = next(p for p in tables if p['title'] == 'Source active-connection bytes')
+        self.assertEqual(bandwidth['gridPos'], dict(x=12, y=byte_table['gridPos']['y'], w=12, h=8))
         self.assertNotIn('topk', bandwidth['targets'][0]['expr'])
         self.assertNotIn('slots_limit', json.dumps(dashboard))
+
+    def test_source_display_and_raw_identity(self):
+        self.assertEqual(source_display('8.8.8.8', 'US'), '\U0001f1fa\U0001f1f8 8.8.8.8')
+        self.assertEqual(source_display('2001:4860::1', ''), '2001:4860::1')
+        self.assertEqual(source_display('8.8.8.8', 'INVALID'), '8.8.8.8')
+        self.worker.current = ['8.8.8.8']
+        self.worker.cache['8.8.8.8'] = dict(data=dict(country_code='US', asn='AS15169', as_name='Google'), checked=1000)
+        rendered = self.worker.render(1001).decode()
+        self.assertIn('source_ip="8.8.8.8"', rendered)
+        self.assertIn('source_ip_display="\U0001f1fa\U0001f1f8 8.8.8.8"', rendered)
+        self.assertEqual(rendered.count('source_ipinfo_info{'), 1)
+
+    def test_source_table_update_is_targeted_and_idempotent(self):
+        import copy
+        from build_dashboard import dashboard
+        from publish_source_tables import update_tables
+        before = copy.deepcopy(dashboard)
+        unrelated = next(p for p in before['panels'] if p['title'] == 'Live destinations')
+        unrelated['custom_user_note'] = 'keep this'
+        table = next(p for p in before['panels'] if p['title'] == 'Source connections')
+        table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Flag'), properties=[]))
+        host_override = dict(matcher=dict(id='byRegexp', options='^(Host|instance|nodename)$'), properties=[])
+        table['fieldConfig']['overrides'].append(host_override)
+        after = update_tables(before)
+        self.assertEqual(after, update_tables(after))
+        changed = next(p for p in after['panels'] if p['title'] == 'Source connections')
+        self.assertIn(host_override, changed['fieldConfig']['overrides'])
+        for a, b in zip(before['panels'], after['panels']):
+            if a['title'] not in ('Source connections', 'Source active-connection bytes'):
+                self.assertEqual(a, b)
+            self.assertEqual(a['gridPos'], b['gridPos'])
 
     def test_active_bytes_one_row_with_separate_direction_columns(self):
         from build_dashboard import dashboard

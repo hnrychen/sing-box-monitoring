@@ -35,3 +35,15 @@ scrape_configs:
   #   body_size_limit: 1MB
   #   static_configs:
   #     - targets: ['127.0.0.1:9120']
+
+  # Optional central HTTPS probes, installed on the Prometheus host.
+  # honor_labels retains the proxy host identity exported by the central worker.
+  # - job_name: sing-box-probes
+  #   honor_labels: true
+  #   scrape_interval: 5s
+  #   scrape_timeout: 4s
+  #   sample_limit: 2000
+  #   label_limit: 12
+  #   body_size_limit: 1MB
+  #   static_configs:
+  #     - targets: ['127.0.0.1:9122']

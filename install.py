@@ -44,6 +44,7 @@ def main():
     parser.add_argument('--source-idle-ttl', type=int, default=3600, help='Seconds to retain inactive source counters; no IP-count limit')
     parser.add_argument('--poll-interval', type=int, default=5)
     parser.add_argument('--tcp-rtt', action='store_true', help='Enable unprivileged Linux TCP RTT snapshots')
+    parser.add_argument('--connection-details', action='store_true', help='Enable authenticated current destination JSON; never metric labels')
     parser.add_argument('--tcp-poll-interval', type=int, default=30)
     parser.add_argument('--process-interval', type=int, default=30)
     parser.add_argument('--cpu-quota', type=int, default=5, help='Maximum percent of one CPU core; 0 disables the cap')
@@ -91,6 +92,7 @@ def main():
               'tls_cert': str(ROOT / 'server.crt'), 'tls_key': str(ROOT / 'server.key'),
               'poll_interval': args.poll_interval, 'source_mode': args.source_mode, 'source_idle_ttl': args.source_idle_ttl,
               'tcp_rtt': args.tcp_rtt, 'tcp_poll_interval': args.tcp_poll_interval, 'process_interval': args.process_interval,
+              'connection_details': args.connection_details or old_config.get('connection_details', False),
               'max_connections': 4096, 'services': []}
     if args.tcp_rtt:
         # Preflight before changing any proxy config; retain explicit budgets.

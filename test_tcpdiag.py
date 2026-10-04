@@ -93,6 +93,50 @@ class TcpTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tcpdiag.snapshot([70000])
 
+    def test_diagnostics_include_idle_sockets_and_observed_counter_baselines(self):
+        row = dict(self.record, socket_cookie=(1, 2), ack_age_seconds=999,
+                   send_queue_bytes=1000, receive_queue_bytes=500, cwnd_segments=10,
+                   send_mss_bytes=1448, notsent_bytes=200, total_retransmissions=7)
+        self.collector.tcp_update([row])
+        text = self.collector.render().decode()
+        self.assertIn('singbox_tcp_cwnd_bytes_sum{service="proxy",protocol="shadowsocks",inbound="ss"} 14480', text)
+        self.assertIn('singbox_tcp_send_queue_bytes{service="proxy",protocol="shadowsocks",inbound="ss"} 1000', text)
+        self.assertNotIn('singbox_tcp_rtt_snapshot_sum', text)
+        key = ('proxy', 'shadowsocks', 'ss')
+        self.assertEqual(self.collector.tcp_retransmissions[key], 0)  # first observation is baseline.
+        self.collector.tcp_update([dict(row, total_retransmissions=10)])
+        self.assertEqual(self.collector.tcp_retransmissions[key], 3)
+        self.collector.tcp_update([dict(row, socket_cookie=(3, 4), total_retransmissions=25)])
+        self.assertEqual(self.collector.tcp_retransmissions[key], 3)  # new socket is not lifetime delta.
+        self.collector.tcp_update([])
+        self.assertEqual(len(self.collector.tcp_previous), 0)
+        self.collector.tcp_update([dict(row, total_retransmissions=100)])
+        self.assertEqual(self.collector.tcp_retransmissions[key], 3)
+        self.collector.tcp_update([dict(row, total_retransmissions=1)])
+        self.assertEqual(self.collector.tcp_retransmissions[key], 3)  # reset never produces negative delta.
+
+    def test_extended_fields_are_length_gated(self):
+        payload = bytearray(72)
+        payload[:2] = bytes([socket.AF_INET, 1])
+        struct.pack_into('=II', payload, 56, 345, 678)
+        struct.pack_into('=II', payload, 44, 123, 456)
+        for length in (76, 84, 104, 148):
+            info = bytearray(length)
+            if length >= 84:
+                struct.pack_into('=I', info, 16, 1448)
+                struct.pack_into('=I', info, 80, 12)
+            if length >= 104:
+                struct.pack_into('=I', info, 100, 9)
+            if length >= 148:
+                struct.pack_into('=I', info, 144, 987)
+            decoded = tcpdiag.decode(payload + struct.pack('=HH', length + 4, 2) + info)
+            self.assertEqual(decoded['receive_queue_bytes'], 345)
+            self.assertEqual(decoded['send_queue_bytes'], 678)
+            self.assertEqual(decoded['socket_cookie'], (123, 456))
+            self.assertEqual('cwnd_segments' in decoded, length >= 84)
+            self.assertEqual('total_retransmissions' in decoded, length >= 104)
+            self.assertEqual('notsent_bytes' in decoded, length >= 148)
+
     @unittest.skipUnless(hasattr(socket, 'AF_NETLINK'), 'Linux SOCK_DIAG required')
     def test_kernel_dump_errors_are_rejected(self):
         class FakeSocket:
@@ -131,6 +175,13 @@ class TcpTests(unittest.TestCase):
                         rows = tcpdiag.snapshot([listener.getsockname()[1]])
                         row = next(r for r in rows if r['peer_port'] == client.getsockname()[1])
                         self.assertEqual(row['rtt_seconds'], expected / 1_000_000)
+                        info = accepted.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+                        self.assertEqual(row['cwnd_segments'], struct.unpack_from('=I', info, 80)[0])
+                        self.assertEqual(row['send_mss_bytes'], struct.unpack_from('=I', info, 16)[0])
+                        self.assertEqual(row['total_retransmissions'], struct.unpack_from('=I', info, 100)[0])
+                        self.assertEqual(row['receive_queue_bytes'], 0)
+                        self.assertEqual(row['send_queue_bytes'], 0)
+                        self.assertNotEqual(row['socket_cookie'], (0xFFFFFFFF, 0xFFFFFFFF))
                         with self.assertRaises(ValueError):
                             tcpdiag.snapshot([listener.getsockname()[1]], max_sockets=0)
                         with self.assertRaises(ValueError):

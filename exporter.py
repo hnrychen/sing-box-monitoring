@@ -17,10 +17,14 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import tcpdiag
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 MAX_RESPONSE = 8 * 1024 * 1024
 API_CLIENT = threading.local()
 RTT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1, 2, 5, math.inf)
+
+
+def connection_text(value, limit=253):
+    return ''.join(c for c in str(value or '')[:limit] if c.isprintable())
 
 
 def labels(values):
@@ -80,6 +84,8 @@ class Collector:
         self.renders = 0
         self.processes = {}
         self.tcp = {}
+        self.tcp_previous = {}
+        self.tcp_retransmissions = collections.defaultdict(int)
         self.certificate_expiry = None
         if config.get('tls_cert'):
             self.certificate_expiry = ssl.cert_time_to_seconds(ssl._ssl._test_decode_cert(config['tls_cert'])['notAfter'])
@@ -123,7 +129,7 @@ class Collector:
         return address
 
     def tcp_update(self, records, now=None):
-        groups, sources = {}, {}
+        groups, sources, following = {}, {}, {}
         candidates = []
         for service in self.config['services']:
             for inbound, info in service.get('inbounds', {}).items():
@@ -133,7 +139,9 @@ class Collector:
                 key = (service['name'], info['type'], inbound)
                 candidates.append((key, info, service.get('tcp_uid')))
                 groups[key] = dict(sockets=0, count=0, sum=0, maximum=0, variation=0,
-                                   ack_age=0, buckets=[0] * len(RTT_BUCKETS))
+                                   ack_age=0, buckets=[0] * len(RTT_BUCKETS),
+                                   send_queue=0, receive_queue=0, cwnd_count=0, cwnd_bytes=0,
+                                   notsent_count=0, notsent=0, retrans_count=0, retrans=0)
         unmatched = 0
         for record in records:
             matching = []
@@ -150,6 +158,25 @@ class Collector:
             key = matching[0]
             group = groups[key]
             group['sockets'] += 1
+            group['send_queue'] += record.get('send_queue_bytes', 0)
+            group['receive_queue'] += record.get('receive_queue_bytes', 0)
+            if 'cwnd_segments' in record and 'send_mss_bytes' in record:
+                group['cwnd_count'] += 1
+                group['cwnd_bytes'] += record['cwnd_segments'] * record['send_mss_bytes']
+            if 'notsent_bytes' in record:
+                group['notsent_count'] += 1
+                group['notsent'] += record['notsent_bytes']
+            if 'total_retransmissions' in record:
+                group['retrans_count'] += 1
+                group['retrans'] += record['total_retransmissions']
+                cookie = record.get('socket_cookie')
+                if cookie is not None and tuple(cookie) != (0xffffffff, 0xffffffff):
+                    identity = (key, tuple(cookie))
+                    total = record['total_retransmissions']
+                    previous = self.tcp_previous.get(identity)
+                    if previous is not None and total >= previous:
+                        self.tcp_retransmissions[key] += total - previous
+                    following[identity] = total
             rtt = record.get('rtt_seconds', 0)
             if rtt <= 0 or record.get('ack_age_seconds', math.inf) > self.config.get('tcp_max_idle', 120):
                 continue
@@ -166,6 +193,7 @@ class Collector:
             values[1] += rtt
             values[2] = max(values[2], rtt)
             values[3] = max(values[3], record['ack_age_seconds'])
+        self.tcp_previous = following  # bounded by current snapshot, no socket history.
         self.tcp = dict(up=1, timestamp=time.time() if now is None else now, groups=groups, sources=sources,
                         unmatched=unmatched, errors=self.tcp.get('errors', 0))
 
@@ -209,6 +237,7 @@ class Collector:
         source_observed = collections.defaultdict(lambda: [0, 0], {k: v.copy() for k, v in old.get('source_observed', {}).items()})
         source_seen = old.get('source_seen', {}).copy()
         following = {}
+        details = []
         dropped = 0
         connections = data.get('connections') or []
         # Reject rather than publish silently truncated "exact" active counts.
@@ -265,6 +294,22 @@ class Collector:
             s[0] += 1
             s[1] += upload
             s[2] += download
+            if self.config.get('connection_details', False):
+                # Current snapshots only: never create destination/ID metric labels.
+                destination = connection_text(md.get('destinationIP'))
+                try:
+                    destination = str(ipaddress.ip_address(destination))
+                except ValueError:
+                    destination = ''
+                try:
+                    port = int(md.get('destinationPort', 0))
+                except (TypeError, ValueError):
+                    port = 0
+                details.append(dict(service=name, source_ip=source, protocol=protocol, network=network,
+                                    domain=connection_text(md.get('host')), destination_ip=destination,
+                                    destination_port=port if 0 < port < 65536 else None,
+                                    outbound=connection_text(chain[0], 120), age_seconds=age,
+                                    upload_bytes=upload, download_bytes=download))
         # Time-based cleanup only: never merge or evict an active IP to meet a
         # count budget. Prometheus retains the historical samples independently.
         idle_ttl = max(60, self.config.get('source_idle_ttl', 3600))
@@ -279,7 +324,21 @@ class Collector:
                                 groups=groups, sources=sources, source_protocols=source_protocols, previous=following,
                                 observed=observed, source_observed=source_observed, source_seen=source_seen,
                                 errors=old.get('errors', 0), resets=old.get('resets', 0) + int(reset),
-                                dropped=dropped, connections=len(connections), duration=0)
+                                dropped=dropped, connections=len(connections), details=details, duration=0)
+
+    def connection_snapshot(self, now=None):
+        now = time.time() if now is None else now
+        rows, services = [], []
+        with self.lock:
+            for service in self.config['services']:
+                state = self.state.get(service['name'], {})
+                timestamp = state.get('timestamp', 0)
+                healthy = state.get('up') == 1 and now - timestamp < max(2, self.config.get('poll_interval', 5)) * 3 + 3
+                services.append(dict(service=service['name'], healthy=healthy, timestamp=timestamp,
+                                     max_age_seconds=max(2, self.config.get('poll_interval', 5)) * 3 + 3))
+                if healthy:
+                    rows.extend(state.get('details', []))
+        return dict(generated_at=now, services=services, rows=rows)
 
     def poll(self, service):
         started = time.monotonic()
@@ -361,6 +420,17 @@ class Collector:
                     for key, values in self.tcp['groups'].items():
                         tags = dict(zip(('service', 'protocol', 'inbound'), key))
                         m.add('tcp_established_sockets', values['sockets'], tags, 'Physical TCP sockets on configured listeners; includes pre-authentication sockets, not logical routed sessions.')
+                        m.add('tcp_send_queue_bytes', values['send_queue'], tags, 'Current server send queue: unacknowledged plus not-yet-sent TCP bytes.')
+                        m.add('tcp_receive_queue_bytes', values['receive_queue'], tags, 'Current TCP bytes waiting for the server application to read.')
+                        m.add('tcp_cwnd_socket_count', values['cwnd_count'], tags, 'Current physical sockets with supported congestion-window fields.')
+                        m.add('tcp_notsent_socket_count', values['notsent_count'], tags, 'Current physical sockets with supported unsent-byte fields.')
+                        if values['cwnd_count']:
+                            m.add('tcp_cwnd_bytes_sum', values['cwnd_bytes'], tags, 'Sum of server send congestion windows: cwnd segments times send MSS; gauge.')
+                        if values['notsent_count']:
+                            m.add('tcp_notsent_bytes', values['notsent'], tags, 'Bytes not yet transmitted; subset of send queue, do not add to it.')
+                        if values['retrans_count'] or not values['sockets']:
+                            m.add('tcp_retransmissions_current', values['retrans'], tags, 'Lifetime retransmissions of current observed sockets; gauge, falls when sockets close.')
+                            m.add('tcp_observed_retransmissions_total', self.tcp_retransmissions[key], tags, 'Retransmission increments between consecutive observed socket snapshots. First observation is baseline; short-lived/final increments may be missed.', 'counter')
                         m.add('tcp_rtt_snapshot_count', values['count'], tags, 'Current TCP sockets with a positive SRTT and recent ACK; gauge, not a counter.')
                         if not values['count']:
                             continue  # Unsupported/idle is not zero milliseconds.
@@ -407,6 +477,9 @@ def serve(config):
                 self.reply(401, b'Unauthorized\n')
             elif self.path == '/metrics':
                 self.reply(200, collector.render(), 'text/plain; version=0.0.4; charset=utf-8')
+            elif self.path == '/connections' and config.get('connection_details', False):
+                self.reply(200, json.dumps(collector.connection_snapshot(), separators=(',', ':')).encode(),
+                           'application/json; charset=utf-8')
             elif self.path == '/healthz':
                 with collector.lock:
                     healthy = all(collector.state.get(s['name'], {}).get('up') == 1 and

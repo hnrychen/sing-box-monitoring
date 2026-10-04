@@ -1,0 +1,18 @@
+{
+  "components": {
+    "exporter": {
+      "arguments": ["--monitor-ip", "192.0.2.20", "--certificate-ip", "192.0.2.10", "--source-mode", "off", "--tcp-rtt"]
+    },
+    "ipinfo": {
+      "token_file": "/etc/sing-box-ipinfo/ipinfo.token",
+      "prometheus_config": "/opt/monitoring/prometheus.yml"
+    },
+    "connections": {
+      "config_file": "/etc/sing-box-connections/config.json"
+    },
+    "probes": {
+      "config_file": "/etc/sing-box-probe/config.json",
+      "prometheus_config": "/opt/monitoring/prometheus.yml"
+    }
+  }
+}
