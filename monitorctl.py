@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 COMPONENTS = {
-    'exporter': ('sing-box-exporter.service', '/opt/sing-box-exporter', ('exporter.py', 'tcpdiag.py')),
+    'exporter': ('sing-box-exporter.service', '/opt/sing-box-exporter', ('sing-box-exporter-go',)),
     'ipinfo': ('sing-box-ipinfo.service', '/opt/sing-box-ipinfo', ('ipinfo_exporter.py',)),
     'connections': ('sing-box-connections.service', '/opt/sing-box-connections', ('connections_view.py',)),
     'probes': ('sing-box-probe.service', '/opt/sing-box-probe', ('proxy_probe.py',)),
@@ -26,7 +26,7 @@ COMPONENTS = {
     'routes': ('route-monitor.service', '/opt/route-monitor', ('collector.py', 'common.py')),
 }
 BUNDLE = pathlib.Path('/opt/sing-box-monitoring')
-BUNDLE_FILES = ('monitorctl.py', 'install.py', 'exporter.py', 'tcpdiag.py', 'install_ipinfo.py',
+BUNDLE_FILES = ('monitorctl.py', 'install.py', 'tcpdiag.py', 'install_ipinfo.py',
     'ipinfo_exporter.py', 'install_connections.py', 'connections_view.py', 'install_proxy_probe.py',
     'proxy_probe.py', 'integrate_probe_prometheus.py', 'register_central_host.py',
     'session_guard.py', 'install_session_guard.py', 'repair_tcp_uids.py', 'native_exporter.py')
@@ -53,7 +53,8 @@ def installed(component):
     relative_route = (component == 'routes' and 'collector.py --config /etc/route-monitor/config.json' in command
                       and run('systemctl', 'show', unit, '-p', 'WorkingDirectory', '--value') == app)
     native_exporter = component == 'exporter' and app + '/sing-box-exporter-go --config /etc/sing-box-exporter/config.json' in command
-    if app + '/' + files[0] not in command and not relative_route and not native_exporter:
+    legacy_exporter = component == 'exporter' and app + '/exporter.py' in command  # Detection/migration only.
+    if app + '/' + files[0] not in command and not relative_route and not native_exporter and not legacy_exporter:
         raise RuntimeError('refusing unrelated/nonstandard unit: ' + unit)
     return True
 
@@ -178,10 +179,10 @@ def upgrade(source, components, dry_run=False, routes=None):
         if not installed(name):
             continue
         unit, app, files = COMPONENTS[name]
-        if name == 'exporter' and '/sing-box-exporter-go ' in run('systemctl', 'show', unit, '-p', 'ExecStart', '--value'):
+        if name == 'exporter':
             if components == ['exporter']:
                 raise ValueError('Go exporter: use native promote --binary PATH to upgrade the native binary')
-            continue  # An all-Python bundle upgrade must not claim to upgrade Go.
+            continue  # Helper-script upgrades never replace the Go collector.
         component_source = route_source(source, routes) if name == 'routes' else source
         if component_source is None:
             raise ValueError('provide --route-source for the installed route collector')
@@ -227,6 +228,8 @@ def upgrade(source, components, dry_run=False, routes=None):
 
 
 def rollback(component, backup):
+    if component == 'exporter':
+        raise ValueError('Go exporter: use native rollback --backup PATH')
     root = BACKUPS.resolve()
     backup = backup.resolve()
     if root not in backup.parents or not installed(component):

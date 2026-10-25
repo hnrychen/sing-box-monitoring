@@ -15,6 +15,7 @@ import sys
 import time
 import urllib.request
 from repair_tcp_uids import service_socket_uid
+from native_exporter import validate_binary, atomic_bytes
 
 ROOT = pathlib.Path('/etc/sing-box-exporter')
 APP = pathlib.Path('/opt/sing-box-exporter')
@@ -38,6 +39,7 @@ def write(path, text, mode=0o640):
 def main():
     import pwd  # Account lookup is needed only by the Linux installer.
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--binary', type=pathlib.Path, required=True, help='Reviewed Go exporter binary matching this Linux host')
     parser.add_argument('--monitor-ip', required=True)
     parser.add_argument('--certificate-ip', required=True, help='IP used by Prometheus for HTTPS verification')
     parser.add_argument('--listen', default='0.0.0.0:9119')
@@ -54,6 +56,7 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run as root')
+    exporter_binary, _ = validate_binary(args.binary)  # Validate before changing accounts/configuration.
     monitor = str(ipaddress.IPv4Address(args.monitor_ip))
     certificate_ip = str(ipaddress.IPv4Address(args.certificate_ip))
     if args.source_idle_ttl < 60:
@@ -181,10 +184,7 @@ def main():
     for path in (config_path, key, crt):
         os.chown(path, 0, account.pw_gid)
         os.chmod(path, 0o640)
-    source = pathlib.Path(__file__).resolve().parent
-    for filename in ('exporter.py', 'tcpdiag.py'):
-        shutil.copyfile(source / filename, APP / filename)
-        os.chmod(APP / filename, 0o644)
+    atomic_bytes(APP / 'sing-box-exporter-go', exporter_binary.read_bytes(), 0o755)
     firewall = f'''table inet sing_box_exporter_access {{
  chain input {{
   type filter hook input priority -10; policy accept;
@@ -215,7 +215,8 @@ Requires=sing-box-exporter-access.service
 [Service]
 User=sing-box-exporter
 Group=sing-box-exporter
-ExecStart=/usr/bin/python3 /opt/sing-box-exporter/exporter.py --config /etc/sing-box-exporter/config.json
+ExecStart=/opt/sing-box-exporter/sing-box-exporter-go --config /etc/sing-box-exporter/config.json
+Environment=GOMAXPROCS=1 GOMEMLIMIT=40MiB
 Restart=always
 RestartSec=3
 StateDirectory=sing-box-exporter

@@ -1,6 +1,6 @@
 # Go sing-box exporter
 
-Dependency-free Go implementation of `../exporter.py`, for Linux amd64 and arm64.
+The only maintained production exporter, for Linux amd64 and arm64.
 It uses the same private JSON configuration, bearer-authenticated HTTPS endpoints,
 service account and `singbox_*` metric names/labels/types. TCP socket diagnostics
 remain unprivileged and read-only. Route monitoring is a separate service.
@@ -45,7 +45,14 @@ or a private temporary directory for real snapshots. It is not an HTTP endpoint.
 
 ## Deploy
 
-Bootstrap the current management bundle first. On an existing Python exporter:
+For a new host, build the correct binary and pass `--binary /path/to/sing-box-exporter-go`
+to `install.py`. Docker also uses a static Go binary, with the built-in
+`--healthcheck --config PATH` mode for authenticated, certificate-verified health.
+The old `exporter.py` module is frozen solely as a compatibility-test
+reference and its CLI refuses to run. Other Python deployment/probe helpers
+remain separate maintained components.
+
+Bootstrap the current management bundle first. To migrate a legacy Python exporter:
 
 ```sh
 sudo sing-box-monitor native shadow --binary /path/to/sing-box-exporter-go
@@ -58,13 +65,16 @@ sudo sing-box-monitor native remove-shadow
 For subsequent native upgrades, use `native promote --binary` directly. It saves
 the current binary and implementation drop-in, restarts only the collector,
 checks authenticated health, and restores the previous implementation if health
-fails. The original Python files and main unit remain available for rollback:
+fails. After migration, upgrades and normal rollback use Go binaries:
 
 ```sh
 sudo sing-box-monitor native rollback --backup /var/backups/sing-box-monitoring/native-exporter-N
 ```
 
-The Python `upgrade exporter` command refuses a running Go exporter, so it cannot
+Rollback rejects Python-only backups before changing the running service.
+Protected legacy backups remain available for deliberate manual emergency recovery.
+
+The management `upgrade exporter` command refuses exporter updates, so it cannot
 report a successful native upgrade after copying unrelated Python files.
 `upgrade all` and the fleet deployment script skip native exporter code; upgrade
 the native binary explicitly. See [operations](../OPERATIONS.md#go-exporter-rollout)

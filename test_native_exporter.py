@@ -1,5 +1,6 @@
 import pathlib
 import os
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,8 +17,8 @@ class NativeDeploymentTests(unittest.TestCase):
                 header[:6] = b'\x7fELF\x02\x01'
                 header[18:20] = machine.to_bytes(2, 'little')
                 candidate.write_bytes(header)
-                with self.subTest(machine=machine), patch.object(native, 'run', side_effect=[host, '1.4.0-go']):
-                    self.assertEqual(native.validate_binary(candidate), (candidate.resolve(), '1.4.0-go'))
+                with self.subTest(machine=machine), patch.object(native, 'run', side_effect=[host, '1.5.0-go']):
+                    self.assertEqual(native.validate_binary(candidate), (candidate.resolve(), '1.5.0-go'))
                 other = 'aarch64' if host == 'x86_64' else 'x86_64'
                 with self.subTest(mismatch=machine), patch.object(native, 'run', return_value=other) as run:
                     with self.assertRaisesRegex(ValueError, 'architecture differs'):
@@ -49,7 +50,7 @@ class NativeDeploymentTests(unittest.TestCase):
             candidate.write_bytes(b'new binary')
             with patch.object(native, 'BINARY', binary), patch.object(native, 'DROPIN', dropin), \
                  patch.object(native, 'BACKUPS', root / 'backups'), patch.object(native, 'production'), \
-                 patch.object(native, 'validate_binary', return_value=(candidate, '1.4.0-go')), \
+                 patch.object(native, 'validate_binary', return_value=(candidate, '1.5.0-go')), \
                  patch.object(native, 'run') as run, patch.object(native, 'health', side_effect=[RuntimeError('failed'), None]):
                 with self.assertRaises(RuntimeError):
                     native.promote(candidate)
@@ -62,6 +63,25 @@ class NativeDeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):
                 native.restore(pathlib.Path(directory))
+
+    def test_go_only_rollback_rejects_python_backup_without_touching_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            saved = root / 'backups' / 'native-exporter-1'
+            saved.mkdir(parents=True)
+            binary = root / 'sing-box-exporter-go'
+            dropin = root / 'implementation.conf'
+            binary.write_bytes(b'current Go binary')
+            entries = [dict(target=str(binary), exists=False),
+                       dict(target=str(dropin), exists=False)]
+            (saved / 'manifest.json').write_text(json.dumps(entries))
+            with patch.object(native, 'BACKUPS', root / 'backups'), \
+                 patch.object(native, 'BINARY', binary), patch.object(native, 'DROPIN', dropin), \
+                 patch.object(native, 'run') as run:
+                with self.assertRaisesRegex(ValueError, 'previous Go binary'):
+                    native.restore(saved, go_only=True)
+                run.assert_not_called()
+            self.assertEqual(binary.read_bytes(), b'current Go binary')
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX deployment symlink check')
     def test_atomic_copy_refuses_symlink(self):

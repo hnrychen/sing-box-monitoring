@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Frozen legacy compatibility oracle. Production exporter maintenance is Go-only.
 """Dependency-free, bounded, read-only sing-box Clash API Prometheus exporter."""
 import argparse
 import collections
@@ -606,10 +607,4 @@ def serve(config):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='/etc/sing-box-exporter/config.json')
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    with open(args.config) as stream:
-        settings = json.load(stream)
-    serve(settings)
+    raise SystemExit('Python exporter retired. Use sing-box-exporter-go; this module is a frozen test reference only.')

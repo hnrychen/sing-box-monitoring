@@ -13,7 +13,7 @@ import (
 	"unicode"
 )
 
-const version = "1.4.0-go"
+const version = "1.5.0-go"
 const maxResponse = 8 << 20
 
 var bounds = []float64{.005, .01, .025, .05, .075, .1, .15, .25, .5, 1, 2, 5, math.Inf(1)}
@@ -165,8 +165,8 @@ func source(c Config, address string) string {
 	}
 	if c.SourceMode == "raw" {
 		if ip.Is4In6() {
-			b := ip.As16()
-			return fmt.Sprintf("::ffff:%x:%x", uint16(b[12])<<8|uint16(b[13]), uint16(b[14])<<8|uint16(b[15]))
+			// Match the deployed collector and current Python ipaddress spelling.
+			return "::ffff:" + ip.Unmap().String()
 		}
 		return ip.String()
 	}

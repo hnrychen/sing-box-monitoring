@@ -6,9 +6,8 @@
 
 A Prometheus exporter and portable Grafana dashboard for monitoring sing-box
 servers. It collects traffic, live sessions, routing, source-IP activity, and
-optional passive TCP round-trip time (RTT). The exporter provides both a
-lightweight Python implementation (standard library only) and an optional
-high-performance Go exporter for Linux amd64 and arm64; neither requires a custom
+optional passive TCP round-trip time (RTT). The maintained exporter is a
+dependency-free Go binary for Linux amd64 and arm64. It does not require a custom
 sing-box build.
 
 **Latest release:** [download the dashboard JSON](https://github.com/hnrychen/sing-box-monitoring/releases/latest/download/dashboard.json)
@@ -30,7 +29,7 @@ or browse the [release notes and source bundle](https://github.com/hnrychen/sing
 
 ## Features
 
-- Optional high-performance [Go exporter](go-exporter/README.md) for Linux
+- High-performance [Go exporter](go-exporter/README.md) for Linux
   amd64 and arm64, preserving identical metric semantics, authentication and
   TLS endpoints with reduced memory and CPU overhead.
 - Optional central end-to-end HTTPS checks through real proxy clients, with
@@ -69,9 +68,9 @@ sing-box servers ─ authenticated loopback Clash API ─ exporters ─ HTTPS/Be
 
 | Component | Requirement |
 | --- | --- |
-| Exporter | Linux and Python 3.11 or newer |
+| Exporter | Linux amd64 or arm64; static Go executable |
 | sing-box | A build with the Clash API enabled; routing metrics cover protocols tracked by that version |
-| Native installer | Debian/Ubuntu-style system with systemd, `openssl`, and `nft` |
+| Native installer | Python 3.11+; Debian/Ubuntu-style system with systemd, `openssl`, and `nft` |
 | Passive TCP RTT | Linux SOCK_DIAG access in the same network namespace as the sockets |
 
 The native installer supports one JSON configuration file per service. For
@@ -80,7 +79,7 @@ other Linux distributions, use the manual exporter configuration. The installer
 currently configures monitoring/firewall addresses over IPv4; TCP diagnostics
 can report IPv4 and IPv6 clients.
 
-Validated with sing-box 1.14.2, Python 3.13, Debian 13, x86_64, and ARM64. The
+Validated with sing-box 1.14.2, Go 1.27.2, Debian 13, x86_64, and ARM64. The
 only sing-box configuration change is enabling an authenticated loopback Clash
 API. The first install may briefly restart the proxy service to apply it; later
 installs do not restart it when the API is already configured.
@@ -95,7 +94,9 @@ server's certificate IP:
 git clone https://github.com/hnrychen/sing-box-monitoring.git
 cd sing-box-monitoring
 
+# First build the matching Linux binary following go-exporter/README.md.
 sudo python3 install.py \
+  --binary /path/to/sing-box-exporter-go \
   --monitor-ip 192.0.2.20 --certificate-ip 192.0.2.10 \
   --source-mode subnet --tcp-rtt
 ```
@@ -109,6 +110,7 @@ Custom names/paths do not require editing the source:
 
 ```sh
 sudo python3 install.py \
+  --binary /path/to/sing-box-exporter-go \
   --monitor-ip 192.0.2.20 --certificate-ip 192.0.2.10 \
   --service proxy-east=/etc/proxy-east/server.json \
   --service proxy-west=/etc/proxy-west/server.json \
@@ -131,12 +133,14 @@ Choose sampling **per machine**, not globally:
 
 ```sh
 # Restricted host: cap applies to exporter, not sing-box.
-sudo python3 install.py --monitor-ip 192.0.2.20 --certificate-ip 192.0.2.10 \
+sudo python3 install.py --binary /path/to/sing-box-exporter-go \
+  --monitor-ip 192.0.2.20 --certificate-ip 192.0.2.10 \
   --tcp-rtt --poll-interval 10 --tcp-poll-interval 30 \
   --process-interval 30 --cpu-quota 2
 
 # Unrestricted host: 0 explicitly removes the exporter CPU quota.
-sudo python3 install.py --monitor-ip 192.0.2.20 --certificate-ip 192.0.2.10 \
+sudo python3 install.py --binary /path/to/sing-box-exporter-go \
+  --monitor-ip 192.0.2.20 --certificate-ip 192.0.2.10 \
   --tcp-rtt --poll-interval 2 --tcp-poll-interval 2 \
   --process-interval 5 --cpu-quota 0
 ```
@@ -240,7 +244,7 @@ loopback API URLs, service identities, listener inventory and real TLS paths.
 Keep config/private keys root- or exporter-readable only. Run:
 
 ```sh
-python3 exporter.py --config /etc/sing-box-exporter/config.json
+./sing-box-exporter-go --config /etc/sing-box-exporter/config.json
 ```
 
 For TCP RTT, set `tcp_rtt: true`, listener `port`, `listen`, and optionally
@@ -264,8 +268,9 @@ No Docker socket, host `/proc`, systemd bus, capabilities, or privileged mode is
 mounted/enabled. **Native process metrics are unavailable in this container**;
 API metrics and host-network TCP RTT work. Do not run both agents on port 9119.
 The default container CPU limit is 0.02 cores; adjust `EXPORTER_CPUS` per host.
-The Python multi-architecture base image is pinned; review/update the pin for
-security maintenance.
+The build uses a pinned Go toolchain version and a scratch runtime. Review/update
+the toolchain for security maintenance. Health checks use the Go CLI with verified
+TLS and bearer authentication; the runtime contains no Python interpreter.
 
 ## Accuracy and metric semantics
 
@@ -332,8 +337,8 @@ No connection IDs, ephemeral ports, domains or destination IPs become labels.
 More distinct IPs increase historical TSDB cardinality: restrict access and retain
 data deliberately. Old `other` history cannot be split back into individual IPs.
 
-Upgrade existing agents by replacing `/opt/sing-box-exporter/exporter.py` with
-the current file and restarting `sing-box-exporter.service`; preserve existing
+Upgrade existing agents with `sing-box-monitor native promote --binary PATH`
+using a reviewed Go binary; preserve existing
 config, secrets, TLS and CPU/memory settings. Old slot files can remain for
 rollback but are no longer read or written. Update the central
 `/opt/sing-box-ipinfo/ipinfo_exporter.py` and restart `sing-box-ipinfo.service`;
@@ -406,7 +411,7 @@ idempotent dashboard/sniff updates.
 
 ## Tests and operations
 
-The optional [Go exporter](go-exporter/README.md) preserves the Python collector's
+The [Go exporter](go-exporter/README.md) is the only maintained runtime, preserving the legacy collector's
 metrics, authenticated HTTPS endpoints and private configuration on Linux amd64
 and arm64. See the rollout comparison and native upgrade/rollback commands in
 [operations](OPERATIONS.md#go-exporter-rollout).

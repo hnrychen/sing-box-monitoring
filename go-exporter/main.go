@@ -280,6 +280,7 @@ func main() {
 	path := flag.String("config", "/etc/sing-box-exporter/config.json", "Configuration path")
 	showVersion := flag.Bool("version", false, "Print build version")
 	fixture := flag.String("fixture", "", "Offline parity fixture (no network)")
+	healthcheck := flag.Bool("healthcheck", false, "Check the local authenticated HTTPS endpoint and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -294,6 +295,12 @@ func main() {
 	cfg, err := readConfig(*path)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *healthcheck {
+		if err := checkHealth(cfg); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 	collector := newCollector(cfg)
 	raw, err := os.ReadFile(cfg.Cert)

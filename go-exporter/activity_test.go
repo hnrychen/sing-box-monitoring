@@ -50,3 +50,11 @@ func TestRecentActivityRollupsExpireAtRenderAndMatchSources(t *testing.T) {
 		t.Fatal("failed collection reported as idle zero")
 	}
 }
+
+func TestMappedSourceLabelCompatibility(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.SourceMode = "raw"
+	if got := source(cfg, "::ffff:203.0.113.10"); got != "::ffff:203.0.113.10" {
+		t.Fatal(got)
+	}
+}

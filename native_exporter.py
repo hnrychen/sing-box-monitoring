@@ -115,13 +115,29 @@ def backup():
     return root
 
 
-def restore(root):
+def validate_backup(root, go_only=False):
     root = pathlib.Path(root).resolve(strict=True)
     if BACKUPS.resolve() not in root.parents or not root.name.startswith('native-exporter-'):
         raise ValueError('expected managed native-exporter backup')
     entries = json.loads((root / 'manifest.json').read_text())
     if {entry['target'] for entry in entries} != {str(BINARY), str(DROPIN)}:
         raise ValueError('unexpected restore targets')
+    if go_only:
+        # Refuse old Python-only backups before touching the running Go service.
+        binary = next(entry for entry in entries if entry['target'] == str(BINARY))
+        if not binary['exists']:
+            raise ValueError('Go-only rollback requires a previous Go binary')
+        validate_binary(root / BINARY.name)
+        dropin = next(entry for entry in entries if entry['target'] == str(DROPIN))
+        unit = (root / DROPIN.name if dropin['exists'] else
+                pathlib.Path('/etc/systemd/system/sing-box-exporter.service')).read_text()
+        if str(BINARY) not in unit or 'exporter.py' in unit:
+            raise ValueError('Go-only rollback requires a Go startup command')
+    return root, entries
+
+
+def restore(root, go_only=False):
+    root, entries = validate_backup(root, go_only)
     for entry in entries:
         target = pathlib.Path(entry['target'])
         if target.is_symlink():
@@ -232,9 +248,10 @@ def main():
     elif args.action == 'rollback':
         if not args.backup:
             parser.error('--backup is required')
+        validate_backup(args.backup, go_only=True)
         recovery = backup()
         try:
-            restore(args.backup)
+            restore(args.backup, go_only=True)
         except Exception:
             restore(recovery)
             raise

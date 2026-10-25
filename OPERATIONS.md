@@ -64,8 +64,8 @@ Keep these backups until the new version has been validated.
 
 ## Go exporter rollout
 
-The optional [Go exporter](go-exporter/README.md) is a dependency-free port of
-`exporter.py` for Linux amd64 and arm64. It preserves the same private JSON
+The [Go exporter](go-exporter/README.md) is the only maintained runtime for Linux
+amd64 and arm64. Python deployment and probe helpers remain separate. It preserves the same private JSON
 configuration, TLS certificates, bearer tokens, service account and `singbox_*`
 metric definitions. Socket diagnostics and Clash API polling remain read-only.
 
@@ -87,7 +87,8 @@ In production rollout comparisons with identical 2s API/TCP and 5s process polli
 | Systemd cgroup Memory | ~15–22 MiB | ~10–11 MiB |
 | Authenticated TLS scrape latency | ~6–11 ms | ~7–15 ms |
 
-Both implementations pass identical offline test suites and real traffic validation.
+This historical comparison used matching fixtures and real traffic validation;
+the Python collector is now frozen as a test reference and cannot run as a service.
 The Go implementation enforces `MemoryMax=64M`, soft heap `GOMEMLIMIT=40MiB`, and `GOMAXPROCS=1`.
 
 ## Central end-to-end HTTPS checks

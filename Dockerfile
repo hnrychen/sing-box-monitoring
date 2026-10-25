@@ -1,8 +1,12 @@
-FROM python:3.13-slim@sha256:bb2988715db2cf7ace7b53f38f3cffbef7c7046a656bee66245eb0ed386e2e81
-WORKDIR /app
-COPY exporter.py /app/exporter.py
-COPY tcpdiag.py /app/tcpdiag.py
-COPY healthcheck.py /app/healthcheck.py
+FROM golang:1.27.2 AS build
+WORKDIR /src
+COPY go-exporter/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /sing-box-exporter-go .
+
+FROM scratch
+COPY --from=build /sing-box-exporter-go /sing-box-exporter-go
+ENV GOMAXPROCS=1 GOMEMLIMIT=40MiB
 USER 65534:65534
 EXPOSE 9119
-ENTRYPOINT ["python3", "/app/exporter.py", "--config", "/config/config.json"]
+ENTRYPOINT ["/sing-box-exporter-go"]
+CMD ["--config", "/config/config.json"]

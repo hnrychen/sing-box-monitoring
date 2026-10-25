@@ -14,7 +14,7 @@ services:
       - /etc/sing-box-exporter:/config:ro
       - /var/lib/sing-box-exporter:/var/lib/sing-box-exporter
     healthcheck:
-      test: [CMD, python3, /app/healthcheck.py]
+      test: [CMD, /sing-box-exporter-go, --config, /config/config.json, --healthcheck]
       interval: 30s
       timeout: 5s
       retries: 3
