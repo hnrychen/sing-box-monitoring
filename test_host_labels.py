@@ -41,6 +41,24 @@ class HostLabelTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 apply_labels({},labels)
 
+    def test_order_is_display_only_and_retains_dynamic_hosts(self):
+        labels = {'second': '🇭🇰 second', 'first': '🇭🇰 first'}
+        dashboard = dict(templating=dict(list=[dict(name='host', sort=1,
+            current=dict(text='All', value='$__all'))]), panels=[])
+        after = apply_labels(dashboard, labels, ['first', 'second'])
+        variable = after['templating']['list'][0]
+        query = variable['query']['query']
+        self.assertIn('sort(', query)
+        self.assertIn('label_replace(vector(1), "instance", "first"', query)
+        self.assertIn('label_replace(vector(2), "instance", "second"', query)
+        self.assertIn('or ((max by(instance)(singbox_up)) * 0 + 3)', query)
+        self.assertEqual(variable['sort'], 0)
+        self.assertEqual(variable['current'], dashboard['templating']['list'][0]['current'])
+        self.assertEqual(after, apply_labels(after, labels, ['first', 'second']))
+        for order in (['first', 'first'], ['missing']):
+            with self.assertRaises(ValueError):
+                apply_labels(dashboard, labels, order)
+
 
 if __name__ == '__main__':
     unittest.main()

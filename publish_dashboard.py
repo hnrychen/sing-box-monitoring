@@ -16,7 +16,10 @@ def publish():
     parser.add_argument('--backup', help='Save current dashboard before overwriting, mode 0600')
     parser.add_argument('--preserve-links', action='store_true', help='Preserve existing local dashboard links')
     parser.add_argument('--host-labels', type=pathlib.Path, help='Optional raw-host to prefixed display-label JSON')
+    parser.add_argument('--host-order', nargs='+', help='Raw hosts to display first; requires --host-labels')
     args = parser.parse_args()
+    if args.host_order and not args.host_labels:
+        parser.error('--host-order requires --host-labels')
     if args.credentials_stdin:
         credentials = json.load(sys.stdin)
         os.environ.update({k: str(v) for k, v in credentials.items() if k in ('GRAFANA_URL', 'GRAFANA_USER', 'GRAFANA_PASSWORD')})
@@ -42,13 +45,17 @@ def publish():
     dashboard = json.loads(pathlib.Path(__file__).with_name('dashboard.json').read_text())
     if args.host_labels:
         from host_labels import apply_labels
-        dashboard = apply_labels(dashboard, json.loads(args.host_labels.read_text(encoding='utf-8-sig')))
+        dashboard = apply_labels(dashboard, json.loads(args.host_labels.read_text(encoding='utf-8-sig')), args.host_order)
     if args.preserve_links:
         dashboard['links'] = current['dashboard'].get('links', [])
     dashboard['templating']['list'][0]['current'] = dict(text=source['name'], value=source['uid'])
     body = json.dumps(dict(dashboard=dashboard, overwrite=True, message='Deploy sing-box fleet monitoring')).encode()
     with urllib.request.urlopen(urllib.request.Request(origin + '/api/dashboards/db', data=body, headers=headers), timeout=15) as response:
         result = json.load(response)
+    with urllib.request.urlopen(urllib.request.Request(origin + '/api/dashboards/uid/' + result['uid'], headers=headers), timeout=15) as response:
+        actual = json.load(response)['dashboard']
+    if actual['version'] != result['version'] or actual['panels'] != dashboard['panels'] or actual['templating'] != dashboard['templating']:
+        raise RuntimeError('Published dashboard did not match the requested version/content')
     print(json.dumps(result))
 
 

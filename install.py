@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Idempotent native deployment. Run as root on Debian/Ubuntu, Python >=3.11."""
 import argparse
-import grp
 import hashlib
 import ipaddress
 import json
 import os
 import pathlib
-import pwd
 import re
 import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
+from repair_tcp_uids import service_socket_uid
 
 ROOT = pathlib.Path('/etc/sing-box-exporter')
 APP = pathlib.Path('/opt/sing-box-exporter')
@@ -36,6 +36,7 @@ def write(path, text, mode=0o640):
 
 
 def main():
+    import pwd  # Account lookup is needed only by the Linux installer.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--monitor-ip', required=True)
     parser.add_argument('--certificate-ip', required=True, help='IP used by Prometheus for HTTPS verification')
@@ -110,6 +111,8 @@ def main():
             if not path.exists() or subprocess.run(['systemctl', 'is-active', '--quiet', name]).returncode:
                 if args.service:
                     raise RuntimeError(name + ': explicit service must be active and its config must exist')
+                print(f'WARNING: skipped default service {name}: inactive or missing config; '
+                      'use --service to select a different live unit/config.', file=sys.stderr)
                 continue
             # Always read the current file; never use a backup as the baseline.
             before = path.read_bytes()
@@ -149,8 +152,7 @@ def main():
                                     'listen': i.get('listen', '::'), 'network': i.get('network', '')}
                                     for i in data.get('inbounds', []) + data.get('endpoints', [])},
                        'outbounds': [(o.get('tag') or o['type']) for o in data.get('outbounds', []) + data.get('endpoints', [])]}
-            pid = int(run('systemctl', 'show', name, '-p', 'MainPID', '--value').stdout.strip())
-            service['tcp_uid'] = os.stat(f'/proc/{pid}').st_uid
+            service['tcp_uid'] = service_socket_uid(name)
             for attempt in range(30):
                 try:
                     req = urllib.request.Request(service['url'] + '/connections', headers={'Authorization': 'Bearer ' + service['secret']})

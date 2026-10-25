@@ -145,7 +145,7 @@ class IpinfoTests(unittest.TestCase):
         options = connections['transformations'][-1]['options']
         self.assertEqual(options['renameByName']['as_name'], 'Organization')
         self.assertTrue(options['excludeByName']['asn'])
-        budget = next(p for p in dashboard['panels'] if p['title'] == 'Source IPs')
+        budget = next(p for p in dashboard['panels'] if p['title'] == 'Source IP counts')
         bandwidth = next(p for p in dashboard['panels'] if p['title'] == 'Observed source bandwidth · sampled')
         self.assertEqual(budget['gridPos'], dict(x=19, y=connections['gridPos']['y'], w=5, h=8))
         byte_table = next(p for p in tables if p['title'] == 'Source active-connection bytes')

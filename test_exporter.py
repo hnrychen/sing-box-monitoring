@@ -7,6 +7,13 @@ import exporter
 
 
 class CollectorTests(unittest.TestCase):
+    def test_without_resource_reports_cpu_and_omits_unavailable_rss(self):
+        app = exporter.Collector(dict(services=[]))
+        with patch.object(exporter, 'resource', None), patch.object(exporter.time, 'process_time', return_value=3.5):
+            metrics = app.render().decode()
+        self.assertIn('exporter_cpu_seconds_total{} 3.5', metrics)
+        self.assertNotIn('exporter_max_rss_bytes', metrics)
+
     def setUp(self):
         self.service = dict(name='sing-box', inbounds={'ss': {'type': 'shadowsocks', 'port': 10443}}, outbounds=['relay'])
         self.collector = exporter.Collector(dict(services=[self.service], source_mode='raw', max_sources=2))

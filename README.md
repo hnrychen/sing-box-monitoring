@@ -6,8 +6,10 @@
 
 A Prometheus exporter and portable Grafana dashboard for monitoring sing-box
 servers. It collects traffic, live sessions, routing, source-IP activity, and
-optional passive TCP round-trip time (RTT). The exporter uses Python's standard
-library and the sing-box Clash API; it does not require a custom sing-box build.
+optional passive TCP round-trip time (RTT). The exporter provides both a
+lightweight Python implementation (standard library only) and an optional
+high-performance Go exporter for Linux amd64 and arm64; neither requires a custom
+sing-box build.
 
 **Latest release:** [download the dashboard JSON](https://github.com/hnrychen/sing-box-monitoring/releases/latest/download/dashboard.json)
 or browse the [release notes and source bundle](https://github.com/hnrychen/sing-box-monitoring/releases/latest).
@@ -20,6 +22,7 @@ or browse the [release notes and source bundle](https://github.com/hnrychen/sing
 - [Connect Prometheus and Grafana](#connect-prometheus-and-grafana)
 - [Manual and container deployment](#manual-and-container-deployment)
 - [Unified operations guide](OPERATIONS.md)
+- [Go exporter](go-exporter/README.md)
 - [Metric accuracy and privacy](#accuracy-and-metric-semantics)
 - [Operations and removal](#tests-and-operations)
 - [Optional IP enrichment](#optional-central-ipinfo-lookup)
@@ -27,12 +30,17 @@ or browse the [release notes and source bundle](https://github.com/hnrychen/sing
 
 ## Features
 
+- Optional high-performance [Go exporter](go-exporter/README.md) for Linux
+  amd64 and arm64, preserving identical metric semantics, authentication and
+  TLS endpoints with reduced memory and CPU overhead.
 - Optional central end-to-end HTTPS checks through real proxy clients, with
   success history, response-time charts and an operational results table.
 - Passive TCP retransmission increments, congestion-window and pending-byte
   diagnostics using the existing socket poll, with no packet capture.
 - [Unified native deployment and management](OPERATIONS.md) of exporter,
   IPinfo, live connections and probes through `sing-box-monitor`.
+- Optional confined background [session guard](OPERATIONS.md#idle-session-cleanup-and-clean-live-views)
+  to audit and clean up abandoned FIN-WAIT-2 TCP sockets.
 - Fleet traffic and availability, inbound protocol inventory, live connections,
   TCP/UDP session breakdowns, egress routing, and individual source-IP activity.
 - Passive client-facing **TCP RTT**: socket-weighted mean, current-socket p95,
@@ -207,8 +215,9 @@ Unknown hosts remain visible under their original names. Keep machine-specific
 mapping files private; the generic dashboard does not hardcode host locations.
 
 Windows Chrome/Edge can show country letters instead of emoji flags. The optional
-Grafana image customization self-hosts a 78KB flag-only font. Ordinary text still
-uses Inter, and code retains its own font. It does not affect exporters:
+Grafana image customization self-hosts a 78KB flag-only font, including an
+Inter regional-indicator alias for canvas timeline labels. Ordinary text still
+uses Grafana's Inter glyphs, and code retains its own font. It does not affect exporters:
 
 ```sh
 python3 fetch_flag_font.py
@@ -270,7 +279,7 @@ security maintenance.
 | `singbox_route_observed_bytes_total`, `source_observed_bytes_total` | Sampled lower bounds; misses short sessions and bytes after their final sample |
 | `singbox_inbound_info`, `process_*`, `exporter_*` | Inventory, native process resources, collection/resource/TLS health |
 | `singbox_tcp_rtt_snapshot_{bucket,sum,count}` | Current physical TCP socket RTT distribution; **all gauges** |
-| `singbox_tcp_rtt_max_seconds`, `tcp_source_rtt_*` | Maximum and per-peer RTT summaries without an IP-count cap |
+| `singbox_tcp_rtt_max_seconds`, `tcp_source_rtt_*` | Maximum raw socket RTT and per-peer RTT with recent payload plus ACK, without an IP-count cap |
 | `singbox_tcp_established_sockets`, `tcp_ack_age_max_seconds`, `tcp_collector_*` | Socket coverage, ACK age and independent diagnostic health |
 
 Upload means client → destination; download means destination → client. Fleet
@@ -368,8 +377,12 @@ belong only to currently active sessions and can decrease when sessions close.
 
 The central worker uses Python's standard library, fetches exporter caches in
 parallel, shares a two-second cache across viewers and stores no history. Failed
-or stale selected collectors raise a visible query error. Sessions closed between
-polls can be missed; UDP rows describe tracked sessions, not packet-level targets.
+or stale selected collectors have explicit `Collector unavailable` Status rows
+with blank destinations/traffic while healthy hosts remain visible. Entirely
+unavailable selections still raise a query error, and `/healthz` remains strict
+for any selected unavailable source. Stale destinations are never reused.
+Sessions closed between polls can be missed; UDP rows describe tracked sessions,
+not packet-level targets.
 Unknown domains stay blank. A destination IP alone is not a unique website identity.
 Optional `ipinfo_metrics_url` reads the existing local IPinfo worker's `/metrics`
 cache to prefix Source IP with a country flag. It adds no external lookups and
@@ -392,6 +405,11 @@ test_connections` to check grouping, privacy, staleness, session removal and
 idempotent dashboard/sniff updates.
 
 ## Tests and operations
+
+The optional [Go exporter](go-exporter/README.md) preserves the Python collector's
+metrics, authenticated HTTPS endpoints and private configuration on Linux amd64
+and arm64. See the rollout comparison and native upgrade/rollback commands in
+[operations](OPERATIONS.md#go-exporter-rollout).
 
 ```sh
 python3 -m unittest -v
@@ -472,7 +490,24 @@ not authenticated user identity or residence. Public IPs are sent to IPinfo;
 enable this opt-in service only if appropriate for your privacy policy. The
 token is never included in metrics, dashboard JSON, URLs, logs or public sources.
 Organization is displayed in a wide, wrapping column instead of numeric ASN.
-Source connections occupies 19/24 width beside the narrow Source IPs chart;
+Source connections occupies 19/24 width beside the narrow Source IP counts chart;
+the chart distinguishes Routed IPs in the latest API snapshots from Retained IPs
+with sampled counters (including inactive IPs until the idle TTL expires). These
+host-level IP counts use only the Host filter, not Service or Protocol filters;
+RTT-only TCP peers are not counted as routed IPs, and there is no slot limit.
+The Source connections table's State column defaults to `Active + RTT`, then
+`Active / QUIC` (Hysteria/Hysteria2/TUIC; Mean RTT `N/A`), then
+`API active / no RTT` (Mean RTT `No sample`), and finally `TCP peer only`.
+The third state separates missing samples on TCP-capable protocols from QUIC's
+unsupported client transport measurement. Missing samples can also mean UDP-only
+Shadowsocks sessions, idle TCP, retained API sessions, or collector unavailability;
+they do not prove disconnection. The Active count is API-reported routed sessions,
+not a physical TCP socket count. Active counts descend within each group;
+missing routed-session counts display a dash. RTT-only peers are not evidence
+of successful authentication or proxy use. Per-IP RTT samples require payload
+and ACK activity within 120 seconds by default, so keepalive-only old sockets
+leave Source connections without hiding recently active TCP peers. Raw fleet-
+level socket diagnostics still include those old sockets. All three dashboard filters apply.
 Observed source bandwidth is below, beside Source active-connection bytes.
 Source active-connection bytes shows one row per host/source IP with Upload and
 Download columns instead of separate direction rows; sorted by Download, with

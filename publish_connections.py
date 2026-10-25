@@ -88,7 +88,7 @@ def main():
     result = request('/api/dashboards/db', dict(dashboard=after, folderUid=current['meta'].get('folderUid', ''), overwrite=True,
                      message='Add current connection destinations between TCP latency and service resources'))
     actual = request('/api/dashboards/uid/sing-box-fleet')['dashboard']
-    if actual['panels'] != after['panels']:
+    if actual['version'] != result['version'] or actual['panels'] != after['panels']:
         raise RuntimeError('published destination section differs')
     print(json.dumps(dict(url=result.get('url'), version=result.get('version'), backup=str(backup))))
 

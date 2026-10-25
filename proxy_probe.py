@@ -8,6 +8,9 @@ import argparse
 import collections
 import concurrent.futures
 import http.server
+import hmac
+import http.client
+import io
 import ipaddress
 import json
 import logging
@@ -17,6 +20,8 @@ import pathlib
 import re
 import signal
 import socket
+import ssl
+import struct
 import subprocess
 import tempfile
 import threading
@@ -29,20 +34,34 @@ def validate(config):
         if name not in config:
             raise ValueError('missing probe configuration field: ' + name)
     host, port = config['listen'].rsplit(':', 1)
-    if not ipaddress.ip_address(host).is_loopback or not 1 <= int(port) <= 65535:
-        raise ValueError('metrics must bind to loopback')
+    address = ipaddress.ip_address(host)
+    if not 1 <= int(port) <= 65535:
+        raise ValueError('invalid metrics listen port')
+    private_lan = any(address in ipaddress.ip_network(network) for network in
+                      ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+    if not address.is_loopback and (not private_lan or not config.get('metrics_token_file')):
+        raise ValueError('non-loopback metrics require a private address and bearer token')
     if not 30 <= config.get('interval', 60) <= 3600 or not 1 <= config.get('timeout', 8) <= 15:
         raise ValueError('invalid interval/timeout')
+    connect_timeout = config.get('connect_timeout', config.get('timeout', 8))
+    if not 1 <= connect_timeout <= config.get('timeout', 8):
+        raise ValueError('connect_timeout must be within request timeout')
     if not 1 <= len(config['targets']) <= 32 or not 1 <= len(config['checks']) <= 4:
         raise ValueError('invalid target/check count')
     if not 1 <= config.get('workers', 2) <= 4:
         raise ValueError('invalid concurrency')
+    if config.get('request_backend', 'native') not in ('native', 'curl'):
+        raise ValueError('invalid request backend')
     if not 1024 <= config.get('client_port_base', 19360) <= 65535 - len(config['targets']):
         raise ValueError('invalid client port range')
     def label(value):
         return isinstance(value, str) and bool(re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', value))
     if not label(config.get('vantage', 'central')):
         raise ValueError('invalid vantage label')
+    token_file = config.get('metrics_token_file')
+    if token_file is not None and (not isinstance(token_file, str) or
+                                   not pathlib.Path(token_file).is_absolute()):
+        raise ValueError('metrics token file must be an absolute path')
     identities = set()
     for target in config['targets']:
         if not all(label(target.get(k)) for k in ('instance', 'service', 'protocol', 'id')):
@@ -75,13 +94,15 @@ def client_config(config):
     return dict(log=dict(level='error'), inbounds=inbounds, outbounds=outbounds, route=dict(rules=rules))
 
 
-def run_check(config, index, check, directory):
+def run_curl_check(config, index, check, directory):
     started = time.monotonic()
     body = pathlib.Path(directory) / (str(index) + '-' + check['name'] + '.body')
     port = config.get('client_port_base', 19360) + index
     command = [config.get('curl_binary', '/usr/bin/curl'), '-q', '--silent', '--show-error',
                '--proxy', f'socks5h://127.0.0.1:{port}', '--noproxy', '',
-               '--connect-timeout', str(min(4, config.get('timeout', 8))),
+               # SOCKS + remote proxy authentication + target TLS share this
+               # budget. A fixed 4s cutoff used to abort valid REALITY handshakes.
+               '--connect-timeout', str(config.get('connect_timeout', config.get('timeout', 8))),
                '--max-time', str(config.get('timeout', 8)), '--max-filesize', '32768',
                '--max-redirs', '0', '--output', str(body), '--write-out', '%{json}', check['url']]
     env = {k: v for k, v in os.environ.items() if k.lower() not in
@@ -110,10 +131,150 @@ def run_check(config, index, check, directory):
     return result
 
 
+class DeadlineReader(io.RawIOBase):
+    """Apply a monotonic deadline to every TLS read, including slow-drip bodies."""
+    WIRE_BUDGET = 128 * 1024
+
+    def __init__(self, sock, deadline):
+        super().__init__()
+        self.sock, self.deadline, self.received = sock, deadline, 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('request deadline')
+        # Bound HTTP headers, framing and body together, not only Content-Length.
+        # Cap the underlying receive itself; an oversized read must not exceed
+        # the wire budget before it is checked. Probes never reuse connections.
+        room = self.WIRE_BUDGET - self.received
+        if room <= 0:
+            raise ValueError('HTTP wire budget')
+        self.sock.settimeout(remaining)
+        count = self.sock.recv_into(memoryview(buffer)[:min(len(buffer), room)])
+        self.received += count
+        return count
+
+
+class ResponseSocket:
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline = sock, deadline
+
+    def makefile(self, mode):
+        return io.BufferedReader(DeadlineReader(self.sock, self.deadline), 4096)
+
+
+def recv_exact(sock, count, deadline):
+    result = bytearray()
+    while len(result) < count:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('connect deadline')
+        sock.settimeout(remaining)
+        chunk = sock.recv(count - len(result))
+        if not chunk:
+            raise OSError('closed SOCKS response')
+        result.extend(chunk)
+    return bytes(result)
+
+
+def run_native_check(config, index, check, context):
+    """Fresh SOCKS5 remote-DNS transport + verified HTTPS, without curl children.
+
+    No pooling/retries/redirects. TLS, SOCKS authentication and the complete body
+    share one overall deadline; the existing connect budget covers through TLS.
+    """
+    started = time.monotonic()
+    deadline = started + config.get('timeout', 8)
+    connect_deadline = min(deadline, started + config.get('connect_timeout', config.get('timeout', 8)))
+    result = dict(success=0, status=0, duration=0, error=1)
+    sock = None
+    try:
+        url = urllib.parse.urlsplit(check['url'])
+        hostname, target_port = url.hostname, url.port or 443
+        sock = socket.create_connection(('127.0.0.1', config.get('client_port_base', 19360) + index),
+                                        timeout=max(0.001, connect_deadline - time.monotonic()))
+        sock.sendall(b'\x05\x01\x00')
+        if recv_exact(sock, 2, connect_deadline) != b'\x05\x00':
+            raise OSError('SOCKS authentication rejected')
+        try:
+            address = ipaddress.ip_address(hostname)
+            destination = bytes([1 if address.version == 4 else 4]) + address.packed
+        except ValueError:
+            encoded = hostname.encode('idna')
+            if not 1 <= len(encoded) <= 255:
+                raise ValueError('SOCKS hostname budget')
+            destination = bytes([3, len(encoded)]) + encoded
+        sock.sendall(b'\x05\x01\x00' + destination + struct.pack('!H', target_port))
+        reply = recv_exact(sock, 4, connect_deadline)
+        if reply[:3] != b'\x05\x00\x00':
+            raise OSError('SOCKS connection rejected')
+        lengths = {1: 4, 4: 16}
+        length = recv_exact(sock, 1, connect_deadline)[0] if reply[3] == 3 else lengths.get(reply[3])
+        if length is None:
+            raise ValueError('invalid SOCKS reply')
+        recv_exact(sock, length + 2, connect_deadline)
+        remaining = connect_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('TLS connect deadline')
+        sock.settimeout(remaining)
+        sock = context.wrap_socket(sock, server_hostname=hostname)
+        if time.monotonic() >= connect_deadline:
+            raise TimeoutError('TLS connect deadline')
+        path = urllib.parse.urlunsplit(('', '', url.path or '/', url.query, ''))
+        host = '[' + hostname + ']' if ':' in hostname else hostname.encode('idna').decode('ascii')
+        if target_port != 443:
+            host += ':' + str(target_port)
+        # A fixed UA and HTTP/1.1 retain deterministic response parsing. Exported
+        # latency remains a full HTTPS request, not a TCP-only surrogate.
+        request = (f'GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sing-box-probe/1.1\r\n'
+                   'Accept: */*\r\nConnection: close\r\n\r\n').encode('ascii')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('request deadline')
+        sock.settimeout(remaining)
+        sock.sendall(request)
+        with http.client.HTTPResponse(ResponseSocket(sock, deadline)) as response:
+            response.begin()
+            result['status'] = response.status
+            body = response.read(32769)
+            if len(body) > 32768:
+                raise ValueError('response body budget')
+            # read(amt) can return a short Content-Length body at EOF. A success
+            # requires the advertised complete response, as curl does.
+            if response.length not in (None, 0):
+                raise ValueError('truncated response body')
+            valid = response.status == check.get('status', 200)
+            if valid and check.get('trace_ip', False):
+                lines = body.decode('utf-8').splitlines()
+                ipaddress.ip_address(next((line[3:] for line in lines if line.startswith('ip=')), ''))
+            if time.monotonic() >= deadline:
+                raise TimeoutError('request deadline')
+            result.update(success=int(valid), error=int(not valid), duration=time.monotonic() - started)
+    except (OSError, ValueError, UnicodeError, http.client.HTTPException):
+        pass  # Never expose credentials, response body or exit IP in logs.
+    finally:
+        if sock is not None:
+            sock.close()
+    result['attempt_duration'] = time.monotonic() - started
+    return result
+
+
+def run_check(config, index, check, directory, context=None):
+    # Curl is an explicit rollback/diagnostic backend, never a failure retry.
+    if config.get('request_backend', 'native') == 'curl':
+        return run_curl_check(config, index, check, directory)
+    return run_native_check(config, index, check, context or ssl.create_default_context())
+
+
 class Prober:
     def __init__(self, config):
         validate(config)
         self.config = config
+        self.tls_context = ssl.create_default_context()
+        self.tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.results = {}
@@ -172,7 +333,7 @@ class Prober:
                 with self.lock:
                     self.runner_up = 1
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.get('workers', 2)) as pool:
-                    futures = {pool.submit(run_check, self.config, index, check, directory): (target, check)
+                    futures = {pool.submit(run_check, self.config, index, check, directory, self.tls_context): (target, check)
                                for index, target, check in jobs}
                     for future in concurrent.futures.as_completed(futures):
                         target, check = futures[future]
@@ -255,6 +416,11 @@ def main():
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     prober = Prober(config)
+    token = None
+    if config.get('metrics_token_file'):
+        token = pathlib.Path(config['metrics_token_file']).read_text().strip()
+        if len(token) < 32 or any(ch.isspace() for ch in token):
+            raise ValueError('invalid metrics bearer token')
     pathlib.Path(config['runtime_dir']).mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.once:
         prober.cycle()
@@ -266,6 +432,13 @@ def main():
         def do_GET(self):
             if self.path != '/metrics':
                 self.send_error(404)
+                return
+            if token is not None and not hmac.compare_digest(
+                    self.headers.get('Authorization', ''), 'Bearer ' + token):
+                self.send_response(401)
+                self.send_header('WWW-Authenticate', 'Bearer')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
                 return
             body = prober.render()
             self.send_response(200)

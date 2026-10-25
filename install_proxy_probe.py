@@ -17,14 +17,22 @@ from proxy_probe import client_config, validate
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config-stdin', required=True, action='store_true')
+    parser.add_argument('--cpu-quota', type=int, default=20, help='Percent of one CPU core (1..100)')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run as root')
+    if not 1 <= args.cpu_quota <= 100:
+        parser.error('--cpu-quota must be 1..100')
     config = json.load(sys.stdin)
+    metrics_token = config.pop('metrics_token', None)
+    if metrics_token is not None:
+        if not isinstance(metrics_token, str) or len(metrics_token) < 32 or any(ch.isspace() for ch in metrics_token):
+            raise ValueError('invalid metrics bearer token')
+        config['metrics_token_file'] = '/etc/sing-box-probe/metrics.token'
     config.update(state_file='/var/lib/sing-box-probe/counters.json', runtime_dir='/run/sing-box-probe',
                   sing_box_binary=shutil.which('sing-box'), curl_binary=shutil.which('curl'))
-    if not config['sing_box_binary'] or not config['curl_binary']:
-        raise ValueError('sing-box and curl must already be installed')
+    if not config['sing_box_binary'] or (config.get('request_backend', 'native') == 'curl' and not config['curl_binary']):
+        raise ValueError('sing-box and the selected request backend must already be installed')
     validate(config)
     with tempfile.TemporaryDirectory(prefix='sing-box-probe-preflight-') as directory:
         path = pathlib.Path(directory) / 'client.json'
@@ -44,11 +52,15 @@ def main():
     os.chown(root, 0, account.pw_gid)
     os.chmod(root, 0o750)
     config_path = root / 'config.json'
+    if metrics_token is not None:
+        token_path = root / 'metrics.token'
+        write(token_path, metrics_token + '\n', 0o640)
+        os.chown(token_path, 0, account.pw_gid)
     write(config_path, json.dumps(config, indent=2) + '\n', 0o640)
     os.chown(config_path, 0, account.pw_gid)
     shutil.copyfile(pathlib.Path(__file__).with_name('proxy_probe.py'), app / 'proxy_probe.py')
     os.chmod(app / 'proxy_probe.py', 0o644)
-    write('/etc/systemd/system/sing-box-probe.service', '''[Unit]
+    unit = '''[Unit]
 Description=Central scheduled end-to-end sing-box HTTPS checks
 After=network-online.target
 Wants=network-online.target
@@ -83,7 +95,9 @@ LimitNOFILE=256
 TimeoutStopSec=30
 [Install]
 WantedBy=multi-user.target
-''', 0o644)
+'''
+    write('/etc/systemd/system/sing-box-probe.service',
+          unit.replace('CPUQuota=20%', f'CPUQuota={args.cpu_quota}%'), 0o644)
     run('systemctl', 'daemon-reload')
     run('systemctl', 'enable', 'sing-box-probe')
     run('systemctl', 'restart', 'sing-box-probe')

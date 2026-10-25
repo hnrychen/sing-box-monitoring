@@ -3,12 +3,14 @@ groups:
     interval: 30s
     rules:
       - alert: SingBoxExporterUnavailable
-        expr: up{job="sing-box"} == 0
+        expr: up{job="sing-box"} == 0 or absent(up{job="sing-box"})
         for: 2m
         labels:
           severity: critical
         annotations:
           summary: "sing-box exporter unavailable on {{ $labels.instance }}"
+          description: "Prometheus cannot scrape the exporter. Check the unit and its authenticated listener before restarting anything."
+          runbook_url: "sing-box-monitoring/OPERATIONS.md#install-and-manage"
       - alert: SingBoxApiUnavailable
         expr: singbox_up == 0
         for: 1m
@@ -16,6 +18,8 @@ groups:
           severity: critical
         annotations:
           summary: "sing-box API unavailable: {{ $labels.instance }} / {{ $labels.service }}"
+          description: "The exporter runs but the sing-box core API is unreachable. Check the service state before restarting the proxy."
+          runbook_url: "sing-box-monitoring/OPERATIONS.md#install-and-manage"
       - alert: SingBoxTcpDiagnosticsUnavailable
         expr: singbox_tcp_collector_up == 0
         for: 2m
@@ -23,6 +27,8 @@ groups:
           severity: warning
         annotations:
           summary: "TCP RTT diagnostics unavailable on {{ $labels.instance }}"
+          description: "TCP RTT collection stopped; traffic may still flow. Confirm listener names and the collector's privileges."
+          runbook_url: "sing-box-monitoring/OPERATIONS.md#passive-tcp-diagnostics"
       - alert: SingBoxExporterCertificateExpiring
         expr: singbox_exporter_certificate_expiry_timestamp_seconds - time() < 30 * 86400
         for: 1h
@@ -30,3 +36,5 @@ groups:
           severity: warning
         annotations:
           summary: "sing-box exporter certificate expires within 30 days on {{ $labels.instance }}"
+          description: "Renew the exporter TLS certificate and restart the exporter; clients fail closed once it expires."
+          runbook_url: "sing-box-monitoring/OPERATIONS.md#exporter-credentials"

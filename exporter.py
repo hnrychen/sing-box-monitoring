@@ -8,7 +8,10 @@ import json
 import logging
 import math
 import os
-import resource
+try:
+    import resource
+except ImportError:  # Pure collector tests also run on Windows.
+    resource = None
 import ssl
 import subprocess
 import threading
@@ -129,7 +132,13 @@ class Collector:
         return address
 
     def tcp_update(self, records, now=None):
+        now = time.time() if now is None else now
         groups, sources, following = {}, {}, {}
+        clients = {}
+        authenticated = set()
+        for service_name, state in self.state.items():
+            if state.get('up') == 1 and now - state.get('timestamp', 0) < max(2, self.config.get('poll_interval', 5)) * 3 + 3:
+                authenticated.update((service_name,) + endpoint for endpoint in state.get('tcp_endpoints', set()))
         candidates = []
         for service in self.config['services']:
             for inbound, info in service.get('inbounds', {}).items():
@@ -142,6 +151,8 @@ class Collector:
                                    ack_age=0, buckets=[0] * len(RTT_BUCKETS),
                                    send_queue=0, receive_queue=0, cwnd_count=0, cwnd_bytes=0,
                                    notsent_count=0, notsent=0, retrans_count=0, retrans=0)
+                clients[key] = dict(count=0, sum=0, maximum=0, ack_age=0, payload_age=0,
+                                    buckets=[0] * len(RTT_BUCKETS))
         unmatched = 0
         for record in records:
             matching = []
@@ -180,6 +191,18 @@ class Collector:
             rtt = record.get('rtt_seconds', 0)
             if rtt <= 0 or record.get('ack_age_seconds', math.inf) > self.config.get('tcp_max_idle', 120):
                 continue
+            # Exact API source tuple + inbound, not just an IP shared by NAT users.
+            endpoint = key + (record['peer_ip'], record['peer_port'])
+            payload_age = record.get('payload_idle_seconds', math.inf)
+            if endpoint in authenticated and payload_age <= self.config.get('tcp_max_idle', 120):
+                client = clients[key]
+                client['count'] += 1
+                client['sum'] += rtt
+                client['maximum'] = max(client['maximum'], rtt)
+                client['ack_age'] = max(client['ack_age'], record['ack_age_seconds'])
+                client['payload_age'] = max(client['payload_age'], payload_age)
+                for index, bound in enumerate(RTT_BUCKETS):
+                    client['buckets'][index] += int(rtt <= bound)
             group['count'] += 1
             group['sum'] += rtt
             group['maximum'] = max(group['maximum'], rtt)
@@ -187,14 +210,17 @@ class Collector:
             group['ack_age'] = max(group['ack_age'], record['ack_age_seconds'])
             for index, bound in enumerate(RTT_BUCKETS):
                 group['buckets'][index] += int(rtt <= bound)
-            source = self.source(record['peer_ip'])
-            values = sources.setdefault(key + (source,), [0, 0, 0, 0])
-            values[0] += 1
-            values[1] += rtt
-            values[2] = max(values[2], rtt)
-            values[3] = max(values[3], record['ack_age_seconds'])
+            # ACKs and keepalives can refresh an old ESTABLISHED socket's RTT
+            # for days. Keep it in raw diagnostics, but not the per-IP table.
+            if payload_age <= self.config.get('tcp_max_idle', 120):
+                source = self.source(record['peer_ip'])
+                values = sources.setdefault(key + (source,), [0, 0, 0, 0])
+                values[0] += 1
+                values[1] += rtt
+                values[2] = max(values[2], rtt)
+                values[3] = max(values[3], record['ack_age_seconds'])
         self.tcp_previous = following  # bounded by current snapshot, no socket history.
-        self.tcp = dict(up=1, timestamp=time.time() if now is None else now, groups=groups, sources=sources,
+        self.tcp = dict(up=1, timestamp=now, groups=groups, sources=sources, clients=clients,
                         unmatched=unmatched, errors=self.tcp.get('errors', 0))
 
     def tcp_poll(self):
@@ -237,6 +263,8 @@ class Collector:
         source_observed = collections.defaultdict(lambda: [0, 0], {k: v.copy() for k, v in old.get('source_observed', {}).items()})
         source_seen = old.get('source_seen', {}).copy()
         following = {}
+        activity, endpoints = {}, set()
+        source_activity = collections.defaultdict(list)
         details = []
         dropped = 0
         connections = data.get('connections') or []
@@ -270,6 +298,25 @@ class Collector:
             upload, download = max(0, int(conn.get('upload', 0))), max(0, int(conn.get('download', 0)))
             cid = str(conn['id'])
             before = previous.get(cid)
+            activity[cid] = (old.get('activity', {}).get(cid, now)
+                             if before == (upload, download) and not reset else now)
+            if old.get('totals') is None or reset:
+                # A restart is not evidence of recent traffic in an old session.
+                try:
+                    from datetime import datetime
+                    activity[cid] = min(now, datetime.fromisoformat(str(conn['start']).replace('Z', '+00:00')).timestamp())
+                except (KeyError, ValueError, TypeError):
+                    activity[cid] = 0
+            source_activity[source_protocol].append(activity[cid])
+            if network == 'tcp' and protocol not in ('hysteria', 'hysteria2', 'tuic'):
+                try:
+                    ip = ipaddress.ip_address(str(md.get('sourceIP', '')))
+                    ip = ip.ipv4_mapped or ip if isinstance(ip, ipaddress.IPv6Address) else ip
+                    port = int(md.get('sourcePort', 0))
+                    if 0 < port < 65536:
+                        endpoints.add((protocol, inbound, str(ip), port))
+                except (ValueError, TypeError):
+                    pass
             # The first-ever snapshot is a baseline, not newly observed traffic.
             delta = (max(0, upload - before[0]), max(0, download - before[1])) if before else ((upload, download) if old else (0, 0))
             if old:
@@ -282,7 +329,7 @@ class Collector:
             age = 0
             try:
                 from datetime import datetime
-                age = max(0, now - datetime.fromisoformat(conn['start'].replace('Z', '+00:00')).timestamp())
+                age = max(0, now - datetime.fromisoformat(str(conn['start']).replace('Z', '+00:00')).timestamp())
             except (KeyError, ValueError):
                 pass
             g = groups[group]
@@ -309,6 +356,7 @@ class Collector:
                                     domain=connection_text(md.get('host')), destination_ip=destination,
                                     destination_port=port if 0 < port < 65536 else None,
                                     outbound=connection_text(chain[0], 120), age_seconds=age,
+                                    last_activity_timestamp=activity[cid],
                                     upload_bytes=upload, download_bytes=download))
         # Time-based cleanup only: never merge or evict an active IP to meet a
         # count budget. Prometheus retains the historical samples independently.
@@ -322,6 +370,7 @@ class Collector:
                 observed[(info['type'], inbound, network, 'direct')]
         self.state[name] = dict(up=1, timestamp=now, totals=totals, memory=data['memory'],
                                 groups=groups, sources=sources, source_protocols=source_protocols, previous=following,
+                                activity=activity, source_activity=source_activity, tcp_endpoints=endpoints,
                                 observed=observed, source_observed=source_observed, source_seen=source_seen,
                                 errors=old.get('errors', 0), resets=old.get('resets', 0) + int(reset),
                                 dropped=dropped, connections=len(connections), details=details, duration=0)
@@ -403,6 +452,8 @@ class Collector:
                         m.add('source_active_bytes', value, dict(stags, direction=direction), 'Lifetime bytes of active connections for this source.')
                 for (protocol, source), count in s['source_protocols'].items():
                     m.add('source_protocol_connections', count, dict(tags, protocol=protocol, source_ip=source), 'Active routed sessions by protocol and source IP; no IP-count cap.')
+                    recent = sum(t > 0 and time.time() - t <= 300 for t in s.get('source_activity', {}).get((protocol, source), []))
+                    m.add('source_protocol_recent_connections', recent, dict(tags, protocol=protocol, source_ip=source), 'Current routed sessions with observed payload activity within five minutes.')
                 for source, values in s['source_observed'].items():
                     for direction, value in zip(('upload', 'download'), values):
                         m.add('source_observed_bytes_total', value, dict(tags, source_ip=source, direction=direction), 'Sampled source bytes; NOT billing grade.', 'counter')
@@ -443,7 +494,23 @@ class Collector:
                     for key, values in self.tcp['sources'].items():
                         tags = dict(zip(('service', 'protocol', 'inbound', 'source_ip'), key))
                         for name, value in zip(('count', 'sum', 'max_seconds', 'ack_age_max_seconds'), values):
-                            m.add('tcp_source_rtt_' + name, value, tags, 'Current TCP peer RTT summary by IP; recent ACK only. All gauges.')
+                            m.add('tcp_source_rtt_' + name, value, tags, 'Current TCP peer RTT summary by IP; recent payload and ACK required. All gauges.')
+                    for key, values in self.tcp.get('clients', {}).items():
+                        tags = dict(zip(('service', 'protocol', 'inbound'), key))
+                        # A failed API cannot authorize a previously sampled socket.
+                        state = self.state.get(key[0], {})
+                        if state.get('up') != 1 or time.time() - state.get('timestamp', 0) >= max(2, self.config.get('poll_interval', 5)) * 3 + 3:
+                            continue
+                        m.add('tcp_client_rtt_snapshot_count', values['count'], tags,
+                              'Authenticated API-matched TCP sockets with recent payload and ACK; gauge.')
+                        if not values['count']:
+                            continue
+                        for suffix, field in (('snapshot_sum', 'sum'), ('max_seconds', 'maximum'),
+                                              ('ack_age_max_seconds', 'ack_age'), ('payload_age_max_seconds', 'payload_age')):
+                            m.add('tcp_client_rtt_' + suffix, values[field], tags, 'Recent authenticated client TCP RTT summary; gauge.')
+                        for bound, count in zip(RTT_BUCKETS, values['buckets']):
+                            m.add('tcp_client_rtt_snapshot_bucket', count, dict(tags, le='+Inf' if math.isinf(bound) else str(bound)),
+                                  'Current authenticated client RTT bucket; gauge, no rate().')
             active_sources = set()
             tracked_sources = set()
             for state in self.state.values():
@@ -453,9 +520,13 @@ class Collector:
             m.add('exporter_source_ips_tracked', len(tracked_sources), {}, 'Source counters retained until one hour idle by default; no IP-count cap.')
             if self.certificate_expiry:
                 m.add('exporter_certificate_expiry_timestamp_seconds', self.certificate_expiry, {}, 'HTTPS certificate expiry; renew and restart exporter before this time.')
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        m.add('exporter_cpu_seconds_total', usage.ru_utime + usage.ru_stime, {}, 'Exporter CPU time.', 'counter')
-        m.add('exporter_max_rss_bytes', usage.ru_maxrss * 1024, {}, 'Linux peak resident memory.')
+        if resource is not None:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            cpu = usage.ru_utime + usage.ru_stime
+            m.add('exporter_max_rss_bytes', usage.ru_maxrss * 1024, {}, 'Linux peak resident memory.')
+        else:
+            cpu = time.process_time()
+        m.add('exporter_cpu_seconds_total', cpu, {}, 'Exporter CPU time.', 'counter')
         m.add('exporter_start_time_seconds', self.started, {}, 'Exporter process start time.')
         m.add('exporter_build_info', 1, {'version': VERSION}, 'Exporter build version.')
         return m.render()

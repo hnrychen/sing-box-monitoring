@@ -3,6 +3,9 @@
     "exporter": {
       "arguments": ["--monitor-ip", "192.0.2.20", "--certificate-ip", "192.0.2.10", "--source-mode", "off", "--tcp-rtt"]
     },
+    "routes": {
+      "arguments": ["--host", "proxy-1", "--address", "192.0.2.10", "--monitor-ip", "192.0.2.20", "--template", "/private/approved-targets.json", "--nexttrace", "/private/nexttrace", "--nexttrace-sha256", "REPLACE_WITH_VERIFIED_SHA256", "--cpu", "2", "--delay", "90"]
+    },
     "ipinfo": {
       "token_file": "/etc/sing-box-ipinfo/ipinfo.token",
       "prometheus_config": "/opt/monitoring/prometheus.yml"

@@ -30,11 +30,23 @@ def display_expression(expression, field, labels):
     return query
 
 
-def selector_query(expression, field, labels):
-    return 'query_result(' + display_expression(expression, field, labels) + ')'
+def selector_query(expression, field, labels, order=None):
+    displayed = display_expression(expression, field, labels)
+    if order:
+        if len(set(order)) != len(order) or any(host not in labels for host in order):
+            raise ValueError('host order must contain unique hosts from the display map')
+        ranks = ' or '.join(
+            'label_replace(vector(' + str(index) + '), ' + json.dumps(field)
+            + ', ' + json.dumps(host) + ', "", "")'
+            for index, host in enumerate(order, 1))
+        # Numeric ranks affect only this variable query. Keep dynamic hosts and
+        # raw host values, placing unranked hosts after the requested sequence.
+        ranks += ' or ((' + expression + ') * 0 + ' + str(len(order) + 1) + ')'
+        displayed = 'sort((' + displayed + ') * 0 + on(' + field + ') group_left() (' + ranks + '))'
+    return 'query_result(' + displayed + ')'
 
 
-def apply_labels(dashboard, labels):
+def apply_labels(dashboard, labels, order=None):
     validate(labels)
     result = copy.deepcopy(dashboard)
     variables = result.get('templating', {}).get('list', [])
@@ -47,11 +59,13 @@ def apply_labels(dashboard, labels):
         elif variable['name'] == 'node':
             expression, field = 'max by(instance)(node_uname_info{job="$job",nodename="$nodename"})', 'instance'
         if field:
-            query = selector_query(expression, field, labels)
+            query = selector_query(expression, field, labels, order)
             variable['definition'] = query
             variable['query'] = dict(query=query, refId='HostDisplayVariableQuery')
             variable['regex'] = '/display_host="(?<text>[^"]+)".*' + field + '="(?<value>[^"]+)"/'
             variable['options'] = []
+            if order:
+                variable['sort'] = 0
             current = variable.get('current', {})
             value = current.get('value')
             if isinstance(value, str) and value in labels:
@@ -68,7 +82,7 @@ def apply_labels(dashboard, labels):
                 overrides[:] = [o for o in overrides if o.get('matcher') != matcher]
                 overrides.append(dict(matcher=matcher, properties=[
                     dict(id='mappings', value=[dict(type='value', options={host: dict(text=display) for host, display in labels.items()})]),
-                    dict(id='custom.width', value=70)]))
+                    dict(id='custom.width', value=max(70, 40 + 8 * max(map(len, labels))))]))
             elif panel.get('type') == 'timeseries':
                 transforms = panel.setdefault('transformations', [])
                 for host, display in sorted(labels.items()):
@@ -97,6 +111,7 @@ def main():
     parser.add_argument('--uid', action='append', required=True, help='Existing dashboard UID; repeat for multiple dashboards')
     parser.add_argument('--credentials-stdin', action='store_true', required=True)
     parser.add_argument('--backup-dir', type=pathlib.Path, required=True)
+    parser.add_argument('--host-order', nargs='+', help='Raw hosts to display first, in this order')
     args = parser.parse_args()
     labels = json.loads(args.labels.read_text(encoding='utf-8-sig'))
     validate(labels)
@@ -112,7 +127,7 @@ def main():
         if not re.fullmatch(r'[A-Za-z0-9_-]+', uid):
             raise ValueError('invalid UID')
         current = request('/api/dashboards/uid/' + uid)
-        after = apply_labels(current['dashboard'], labels)
+        after = apply_labels(current['dashboard'], labels, args.host_order)
         path = args.backup_dir / (uid + '-' + str(time.time_ns()) + '.json')
         with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:
             json.dump(current, stream)
@@ -121,6 +136,7 @@ def main():
             raise RuntimeError('dashboard changed during update')
         published = request('/api/dashboards/db', dict(dashboard=after, folderUid=current['meta'].get('folderUid', ''), overwrite=True, message='Prefix host display labels with country flags'))
         actual = request('/api/dashboards/uid/' + uid)['dashboard']
+        assert actual['version'] == published['version']
         assert actual['templating']['list'] == after['templating']['list']
         assert actual['panels'] == after['panels']
         print(json.dumps(dict(title=actual['title'], version=published['version'], backup=str(path))))

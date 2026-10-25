@@ -7,6 +7,17 @@
   src: url('../fonts/TwemojiCountryFlags.woff2') format('woff2');
   unicode-range: U+1F1E6-1F1FF;
 }
+/* Grafana canvas timelines explicitly use Inter instead of inheriting body.
+   Supply only Inter's missing regional-indicator glyphs; regular text retains
+   Grafana's own Inter files, metrics and weights. */
+@font-face {
+  font-family: Inter;
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('../fonts/TwemojiCountryFlags.woff2') format('woff2');
+  unicode-range: U+1F1E6-1F1FF;
+}
 body, button, input, select, textarea {
   /* Grafana injects its base font rule after static CSS. This keeps the flag
      fallback first without overriding explicit monospace fonts on code. */

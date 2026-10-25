@@ -12,14 +12,16 @@ def address(family, raw):
     return str(ip.ipv4_mapped or ip) if isinstance(ip, ipaddress.IPv6Address) else str(ip)
 
 
-def decode(payload):
+def decode(payload, states=(1,)):
     if len(payload) < 72:
         raise ValueError('short inet_diag message')
     family, state = payload[:2]
-    if family not in (socket.AF_INET, socket.AF_INET6) or state != 1:
+    if family not in (socket.AF_INET, socket.AF_INET6) or state not in states:
         return None
     local_port, peer_port = struct.unpack_from('!HH', payload, 4)
-    result = dict(local_ip=address(family, payload[8:24]), peer_ip=address(family, payload[24:40]),
+    result = dict(family=family, state=state, socket_id=bytes(payload[4:52]),
+                  inode=struct.unpack_from('=I', payload, 68)[0],
+                  local_ip=address(family, payload[8:24]), peer_ip=address(family, payload[24:40]),
                   local_port=local_port, peer_port=peer_port,
                   uid=struct.unpack_from('=I', payload, 64)[0],
                   socket_cookie=struct.unpack_from('=II', payload, 44),
@@ -34,6 +36,8 @@ def decode(payload):
             rtt, variation = struct.unpack_from('=II', payload, offset + 4 + 68)
             result.update(rtt_seconds=rtt / 1_000_000, variation_seconds=variation / 1_000_000)
             result['ack_age_seconds'] = struct.unpack_from('=I', payload, offset + 4 + 56)[0] / 1000
+            result['payload_idle_seconds'] = min(struct.unpack_from('=I', payload, offset + 4 + pos)[0]
+                                                for pos in (44, 52)) / 1000
             # Length-gated Linux UAPI fields: older kernels omit, never fake zero.
             for name, field_offset in (('send_mss_bytes', 16), ('cwnd_segments', 80),
                                        ('total_retransmissions', 100), ('notsent_bytes', 144)):
@@ -43,21 +47,23 @@ def decode(payload):
     return result
 
 
-def snapshot(ports, max_sockets=4096, max_bytes=8 * 1024 * 1024, timeout=3):
-    """Only ESTABLISHED sockets with a requested LOCAL listener port.
+def snapshot(ports, max_sockets=4096, max_bytes=8 * 1024 * 1024, timeout=3, states=(1,)):
+    """By default, ESTABLISHED sockets with a requested LOCAL listener port.
 
     A failed/interrupted/budget-exceeded dump is rejected, never truncated.
     Limits apply to the whole IPv4+IPv6 snapshot. No root/capabilities needed.
     """
-    ports = sorted(set(int(p) for p in ports))
-    if len(ports) > 32 or any(not 1 <= p <= 65535 for p in ports):
+    # None means all local ports, for the separately privileged cleanup guard.
+    all_ports = ports is None
+    ports = [0] if all_ports else sorted(set(int(p) for p in ports))
+    if len(ports) > 32 or any(not (0 if all_ports else 1) <= p <= 65535 for p in ports) or not states or any(s not in range(1, 13) for s in states):
         raise ValueError('invalid TCP listener port inventory')
     records, size, sequence = [], 0, 0
     deadline = time.monotonic() + timeout
     for port in ports:
         for family in (socket.AF_INET, socket.AF_INET6):
             sequence += 1
-            request = (struct.pack('=BBBBI', family, socket.IPPROTO_TCP, 2, 0, 1 << 1)
+            request = (struct.pack('=BBBBI', family, socket.IPPROTO_TCP, 2, 0, sum(1 << s for s in set(states)))
                        + struct.pack('!HH', port, 0) + bytes(32)
                        + struct.pack('=III', 0, 0xffffffff, 0xffffffff))
             header = struct.pack('=IHHII', 16 + len(request), 20, 0x301, sequence, 0)
@@ -94,10 +100,36 @@ def snapshot(ports, max_sockets=4096, max_bytes=8 * 1024 * 1024, timeout=3):
                             if kind == 3:
                                 done = True
                         elif kind == 20:
-                            record = decode(payload)
-                            if record and record['local_port'] == port:
+                            record = decode(payload, states)
+                            if record and (not port or record['local_port'] == port):
                                 records.append(record)
                                 if len(records) > max_sockets:
                                     raise ValueError('TCP socket budget exceeded')
                         offset += (length + 3) & ~3
     return records
+
+
+def destroy(record):
+    """Abort one exact FIN-WAIT-2 socket. Only the privileged guard calls this.
+
+    Kernel cookie validation prevents killing a new socket reusing the tuple.
+    Requires CAP_NET_ADMIN; the read-only exporter never gains this capability.
+    """
+    cookie = tuple(record.get('socket_cookie', (0xffffffff, 0xffffffff)))
+    if record.get('state') != 5 or cookie == (0xffffffff, 0xffffffff) or len(record.get('socket_id', b'')) != 48:
+        raise ValueError('refusing non-FIN-WAIT-2 or unidentified socket')
+    request = struct.pack('=BBBBI', record['family'], socket.IPPROTO_TCP, 0, 0, 1 << 5) + record['socket_id']
+    packet = struct.pack('=IHHII', 16 + len(request), 21, 5, 1, 0) + request  # SOCK_DESTROY, REQUEST|ACK
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4) as diag:
+        diag.settimeout(3)
+        diag.bind((0, 0))
+        diag.sendto(packet, (0, 0))
+        reply, _, flags, sender = diag.recvmsg(4096)
+    if sender[0] != 0 or flags & socket.MSG_TRUNC or len(reply) < 20:
+        raise ValueError('invalid socket destroy acknowledgment')
+    length, kind, _, seq, _ = struct.unpack_from('=IHHII', reply)
+    if length > len(reply) or kind != 2 or seq != 1:
+        raise ValueError('unexpected socket destroy acknowledgment')
+    error = struct.unpack_from('=i', reply, 16)[0]
+    if error:
+        raise OSError(-error, 'socket destroy failed')

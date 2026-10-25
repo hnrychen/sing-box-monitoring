@@ -1,9 +1,9 @@
 # Unified monitoring operations
 
 `monitorctl.py` provides one native systemd management entry point for these
-helpers: **exporter**, **ipinfo**, **connections**, and **probes**. It keeps their
-existing private configuration paths and resource limits. It does not manage
-sing-box proxy cores, Prometheus, Grafana, node exporter or unrelated monitors.
+helpers: **exporter**, **ipinfo**, **connections**, **probes**, and **sessions**.
+It keeps their existing private configuration paths and resource limits. It does not
+manage sing-box proxy cores, Prometheus, Grafana, node exporter or unrelated monitors.
 No additional container stack is required.
 
 ## Install and manage
@@ -14,9 +14,12 @@ helper below. From the reviewed source directory, group installed helpers:
 ```sh
 sudo python3 monitorctl.py bootstrap --source "$PWD"
 sudo sing-box-monitor status
+sudo sing-box-monitor check               # authenticated local TLS health
+sudo sing-box-monitor rtt                 # inspect configured versus live socket UID
+sudo sing-box-monitor rtt --apply         # repair mismatches; restart only exporter
 sudo sing-box-monitor logs probes --lines 30
 sudo sing-box-monitor restart probes     # just this helper
-sudo sing-box-monitor restart            # all four installed helpers
+sudo sing-box-monitor restart            # all installed monitoring helpers
 ```
 
 The persistent `sing-box-monitoring.target` starts installed helpers at boot.
@@ -59,9 +62,38 @@ restored automatically if that helper fails to restart. A running process alone
 does not prove upstream connectivity: inspect Grafana health/checks afterwards.
 Keep these backups until the new version has been validated.
 
+## Go exporter rollout
+
+The optional [Go exporter](go-exporter/README.md) is a dependency-free port of
+`exporter.py` for Linux amd64 and arm64. It preserves the same private JSON
+configuration, TLS certificates, bearer tokens, service account and `singbox_*`
+metric definitions. Socket diagnostics and Clash API polling remain read-only.
+
+`monitorctl.py` / `sing-box-monitor` provides native lifecycle commands:
+
+- `native shadow --binary /path/to/binary`: starts a shadow instance on loopback port 19119 using existing credentials.
+- `native promote --binary /path/to/binary`: backs up the current binary and systemd drop-in, checks authenticated HTTPS health on port 9119, and rolls back automatically if health check fails.
+- `native rollback --backup /var/backups/sing-box-monitoring/native-exporter-N`: restores the previous executable and configuration.
+- `native remove-shadow`: cleans up the temporary shadow unit.
+
+### Resource comparison
+
+In production rollout comparisons with identical 2s API/TCP and 5s process polling under live traffic:
+
+| Metric | Python exporter | Go exporter |
+| --- | ---: | ---: |
+| Single-core CPU % | ~0.8–1.2% | ~0.7–0.9% |
+| Process RSS | ~21–28 MiB | ~13–17 MiB |
+| Systemd cgroup Memory | ~15–22 MiB | ~10–11 MiB |
+| Authenticated TLS scrape latency | ~6–11 ms | ~7–15 ms |
+
+Both implementations pass identical offline test suites and real traffic validation.
+The Go implementation enforces `MemoryMax=64M`, soft heap `GOMEMLIMIT=40MiB`, and `GOMAXPROCS=1`.
+
 ## Central end-to-end HTTPS checks
 
-Requires existing Python 3, sing-box and curl on the central host. Copy
+Requires existing Python 3 and sing-box on the central host; curl is required
+only for the explicit `request_backend: "curl"` fallback. Copy
 `probe.example.json`, supply one real client **outbound** per listener, and keep
 the result private. Never publish this file; it contains proxy credentials.
 An outbound must be compatible with the central sing-box version.
@@ -75,23 +107,23 @@ The dedicated `sing-box-probe.service` exposes cached metrics on loopback
 `127.0.0.1:9122`. Default cadence is 60s, timeout 8s, concurrency two, up to four
 small HTTPS checks per listener. Each cycle creates a short-lived, isolated
 loopback SOCKS client with fresh transports, without TUN or system route changes.
-Curl explicitly uses the proxy, verifies TLS, has no direct fallback, does not
-follow redirects, and caps each body at 32KiB. The listener config is checked
-before installation. Temporary configs/bodies are private and removed after
-each cycle; credential-bearing child output is not logged.
-
-Choose stable small endpoints. An HTTP-200 trace check validates a returned exit
-IP but does not retain/export it. A ChatGPT endpoint check validates that specific
-HTTPS path, not login, browser JavaScript, every API or application functionality.
-HTTPS-over-Hysteria2 checks exercise the real QUIC proxy transport, but are not
-the client's QUIC RTT and do not establish arbitrary UDP application health.
-Requests originate from the central host, so geographical distance affects time.
+The default native request backend uses SOCKS5 remote DNS and verified TLS,
+without curl children or response-body files. A reusable TLS context avoids
+reloading the trust store per check; every request still creates a fresh socket
+and TLS transport. There is no direct fallback, pooling, redirect or retry.
+The complete SOCKS/TLS/HTTP/body request shares the monotonic overall deadline;
+`connect_timeout` also covers through the TLS handshake. Bodies are capped at
+32KiB, HTTP wire data at 128KiB, and truncated Content-Length/chunked bodies fail.
+Temporary client configurations remain private and are removed after each cycle;
+credential-bearing child output and response bodies are not logged. Set
+`request_backend` to `curl` and restart only the probe helper for diagnostic
+rollback; a failed native request never automatically retries with curl.
 
 Probe metrics use only configured host/service/protocol/listener/check/vantage
 labels, never URL, destination IP, source IP, exit IP or connection IDs:
 
 - `singbox_probe_success`: latest **fresh** check, 1 passed or 0 failed.
-- `singbox_probe_duration_seconds`: successful curl request time, including
+- `singbox_probe_duration_seconds`: successful HTTPS request time, including
   proxy setup, remote-path DNS, TLS and response; excludes client process startup.
   Failed checks omit this value rather than showing zero or an old success.
 - `singbox_probe_attempt_duration_seconds`: elapsed attempt including failure.
@@ -140,6 +172,54 @@ cannot use these fields. Optional fields are length-gated for kernel support.
   Do not add these together. A zero queue is valid; stale collection omits values.
 
 Source: [Linux TCP_INFO](https://github.com/torvalds/linux/blob/master/include/uapi/linux/tcp.h).
+
+## Idle-session cleanup and clean live views
+
+The exporter remains read-only and unprivileged. Main RTT panels use
+`singbox_tcp_client_rtt_*`: fresh API-authenticated sessions matched by exact
+inbound, source IP and source port, with TCP payload and ACK activity within
+`tcp_max_idle` (120 seconds by default). Raw `singbox_tcp_rtt_*` metrics and
+physical socket/queue/retransmission metrics remain available for diagnostics.
+QUIC/Hysteria2 client RTT is still unsupported; gaps are not zero latency.
+
+Live destinations defaults to byte activity observed in the last five minutes.
+Choose **Destination view → All open sessions** to inspect idle sessions and
+the **Idle** column. A collector restart establishes a new conservative baseline;
+unchanged sessions disappear from the recent view after five minutes. This is a
+display filter, not a claim that an idle session has closed. Source/route API
+counts remain exact for all open sessions.
+
+Install the separate, opt-in guard on a native Linux/systemd host:
+
+```sh
+sudo python3 install_session_guard.py                   # audit only
+sudo python3 install_session_guard.py --enable-cleanup  # explicit selective closure
+sudo python3 monitorctl.py bootstrap --source .
+sudo sing-box-monitor logs sessions
+```
+
+It runs every five minutes, keeps bounded current-socket state, and closes only
+sing-box MainPID-owned **FIN-WAIT-2** sockets observed in that state for at least
+one hour, without TCP payload for one hour, with empty receive/send queues.
+The process executable, PID/FD ownership, current socket state and kernel cookie
+are revalidated. It never closes ESTABLISHED sockets, UDP/QUIC transports, listeners
+or whole services, and never creates IP bans. At most 256 closures per run, with
+2% CPU and 64 MiB memory limits. Initial deployment waits one hour before any
+closure; it does not infer state duration from connection age. Kernel
+`CONFIG_INET_DIAG_DESTROY` support is required; errors fail closed and are logged.
+Only this separately confined root service has socket-destroy capabilities;
+the exporter has none. Inspect its journal for actual closure counts.
+
+`verify_session_guard_kernel.py` can verify kernel/capability support on a new
+host without touching a production session: it creates one loopback TCP socket,
+moves it to FIN-WAIT-2, destroys that exact test socket, then exits. Run it as
+root from the reviewed source directory before relying on cleanup, especially
+inside LXC containers. This verifies the kernel operation, not that a real
+sing-box session has yet met the one-hour eligibility rule.
+
+Manifest entry: `"sessions": {"enable_cleanup": true}` (false/default is audit).
+Rollback: `sudo systemctl disable --now sing-box-session-guard.timer`; leave
+historical metrics alone. No proxy restart or global TCP timeout change is needed.
 
 ## Consistent listener names
 

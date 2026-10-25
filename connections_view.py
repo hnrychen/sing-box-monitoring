@@ -59,6 +59,9 @@ def source_label(address, countries):
 
 def group_rows(snapshots, params, now=None):
     now = time.time() if now is None else now
+    mode = params.get('var-activity', ['recent'])
+    if mode not in (['recent'], ['all']):
+        raise ValueError('invalid activity view')
     groups = {}
     for host, snapshot in snapshots.items():
         if not selected(host, params.get('var-host')):
@@ -70,6 +73,9 @@ def group_rows(snapshots, params, now=None):
         for row in snapshot['rows']:
             if not selected(row['service'], params.get('var-service')) or not selected(row['protocol'], params.get('var-protocol')):
                 continue
+            idle = max(0, now - row.get('last_activity_timestamp', snapshot.get('generated_at', now)))
+            if mode == ['recent'] and idle > 300:
+                continue
             # No reverse DNS guesses: a CDN IP does not uniquely identify a website.
             address = row['destination_ip'] or row['domain'] or 'unknown'
             if ':' in address:
@@ -77,11 +83,12 @@ def group_rows(snapshots, params, now=None):
             destination = address + (':' + str(row['destination_port']) if row['destination_port'] else '')
             key = (host, row['service'], row['source_ip'], row['protocol'], row['network'], row['domain'], destination, row['outbound'])
             group = groups.setdefault(key, dict(zip(('host', 'service', 'source_ip', 'protocol', 'network', 'domain', 'destination', 'outbound'), key),
-                                                active=0, upload_bytes=0, download_bytes=0, age_seconds=0))
+                                                active=0, upload_bytes=0, download_bytes=0, age_seconds=0, idle_seconds=0))
             group['active'] += 1
             group['upload_bytes'] += row['upload_bytes']
             group['download_bytes'] += row['download_bytes']
             group['age_seconds'] = max(group['age_seconds'], row['age_seconds'])
+            group['idle_seconds'] = max(group['idle_seconds'], idle)
     return sorted(groups.values(), key=lambda row: (-row['download_bytes'], row['host'], row['source_ip'], row['destination']))
 
 
@@ -116,7 +123,10 @@ class View:
 
     def fetch(self, host):
         url, opener, token = self.clients[host]
-        request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + token})
+        request = urllib.request.Request(url, headers={
+            'Authorization': 'Bearer ' + token,
+            'User-Agent': 'sing-box-monitor/1.0',
+        })
         with opener.open(request, timeout=4) as response:
             raw = response.read(MAX_RESPONSE + 1)
         if len(raw) > MAX_RESPONSE:
@@ -126,7 +136,7 @@ class View:
             raise ValueError('invalid connection snapshot')
         return data
 
-    def rows(self, params):
+    def rows(self, params, strict=False):
         with self.lock:
             if time.monotonic() - self.last_fetch >= 2:
                 country_future = self.pool.submit(self.fetch_countries) if getattr(self, 'ipinfo_url', None) else None
@@ -141,13 +151,34 @@ class View:
                 self.snapshots, self.failures = snapshots, failures
                 self.countries = country_future.result() if country_future else {}
                 self.last_fetch = time.monotonic()
-            failures = sorted(host for host in self.failures if selected(host, params.get('var-host')))
-            if failures:
-                raise ValueError('Unavailable collector: ' + ', '.join(failures))
-            rows = group_rows(self.snapshots, params)
+            group_rows({}, params)  # Validate view options before processing sources.
+            failures, rows, healthy = [], [], 0
+            for host in self.clients:
+                if not selected(host, params.get('var-host')):
+                    continue
+                if host in self.failures or host not in self.snapshots:
+                    failures.append(host)
+                    continue
+                try:
+                    current = group_rows({host: self.snapshots[host]}, params)
+                except (ValueError, KeyError, TypeError):
+                    failures.append(host)
+                    continue  # Never reuse old rows from a stale/unhealthy source.
+                rows.extend(current)
+                healthy += 1
+            if failures and (strict or not healthy):
+                raise ValueError('Unavailable collector: ' + ', '.join(sorted(failures)))
             for row in rows:
                 row['source_ip_display'] = source_label(row['source_ip'], self.countries)
-            return rows
+                row['status'] = 'Live'
+            # Explicit availability rows keep partial failures visible without
+            # inventing sessions, destinations or zero traffic for an offline host.
+            unavailable = [dict(host=host, status='Collector unavailable', service='',
+                                source_ip='', source_ip_display='', protocol='', network='',
+                                domain='', destination='', outbound='', active=None,
+                                upload_bytes=None, download_bytes=None, age_seconds=None,
+                                idle_seconds=None) for host in sorted(failures)]
+            return unavailable + rows
 
     def fetch_countries(self):
         try:
@@ -174,7 +205,7 @@ def serve(config):
                 self.reply(404, {'error': 'Not found'})
                 return
             try:
-                rows = view.rows(urllib.parse.parse_qs(url.query))
+                rows = view.rows(urllib.parse.parse_qs(url.query), strict=url.path == '/healthz')
                 self.reply(200, {'rows': rows} if url.path == '/connections' else {'healthy': True})
             except ValueError as exc:
                 self.reply(503, {'error': str(exc)})

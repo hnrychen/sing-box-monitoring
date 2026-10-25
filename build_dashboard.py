@@ -101,19 +101,37 @@ panel('Active routing paths', 'table', 0, 29, 16, 8,
 panel('Configured protocol listeners', 'table', 16, 29, 8, 8,
       [(f'singbox_inbound_info{{{ROUTE}}}', '')], description='Inventory includes idle listeners. API collection health is shown above; inventory is not a synthetic connectivity probe.')
 row('Source clients', 37)
+SOURCE_KEY = 'instance,service,protocol,source_ip'
+source_active = f'sum by({SOURCE_KEY})(singbox_source_protocol_${{source_activity}}{{{ROUTE}}}) > 0'
+source_rtt = f'(sum by({SOURCE_KEY})(singbox_tcp_source_rtt_sum{{{ROUTE}}}) / sum by({SOURCE_KEY})(singbox_tcp_source_rtt_count{{{ROUTE}}})) > 0'
+source_quic = f'sum by({SOURCE_KEY})(singbox_source_protocol_${{source_activity}}{{{ROUTE},protocol=~"hysteria|hysteria2|tuic"}}) > 0'
+source_without_rtt = f'({source_active}) unless on({SOURCE_KEY}) ({source_rtt})'
+source_quic_without_rtt = f'({source_without_rtt}) and on({SOURCE_KEY}) ({source_quic})'
+# -1 is a dashboard-only categorical marker mapped to N/A, not a measured RTT.
+# TCP-capable protocols without a sample remain null and display "No sample".
+source_rtt_display = f'({source_rtt}) or (({source_quic_without_rtt}) * 0 - 1)'
+# Match raw identities before optional enrichment. A TCP peer is not necessarily
+# an authenticated/routed session; retain those peers, but sort them last.
+source_state = (f'((({source_active}) and on({SOURCE_KEY}) ({source_rtt})) * 0 + 1) or '
+                f'(({source_quic_without_rtt}) * 0 + 2) or '
+                f'((({source_without_rtt}) unless on({SOURCE_KEY}) ({source_quic})) * 0 + 3) or '
+                f'((({source_rtt}) unless on({SOURCE_KEY}) ({source_active})) * 0 + 4)')
 source_panel = panel('Source connections', 'table', 0, 38, 19, 8,
-      [(enrich(f'sum by(instance,service,protocol,source_ip)(singbox_source_protocol_connections{{{ROUTE}}})'), ''),
-       (enrich(f'sum by(instance,service,protocol,source_ip)(singbox_tcp_source_rtt_sum{{{ROUTE}}}) / sum by(instance,service,protocol,source_ip)(singbox_tcp_source_rtt_count{{{ROUTE}}})'), '')],
-      description='Currently active routed sessions and socket-weighted mean physical TCP RTT by host/service/protocol/source IP, with no IP-count cap. Disconnected clients can remain in historical bandwidth charts but not this current-session table. Country flag and Organization (IPinfo as_name) come from optional central IPinfo Lite enrichment, cached for 7 days by default; missing attribution stays blank without dropping connections. Country describes the peer IP, not verified user residence. TCP RTT is pooled across listeners of the same protocol; UDP/QUIC and idle/unsupported RTT are blank, not zero. All three global filters apply. NAT/relay IPs are not individual users; maximum RTT remains in the latency chart.')
+      [(enrich(source_active), ''), (enrich(source_rtt_display), ''), (enrich(source_state), '')],
+      description='Source view defaults to Recent traffic: routed sessions expire individually after five minutes without observed payload byte changes. Counts include only those recent sessions; All open sessions includes idle API sessions. A collector restart uses session start time until new byte changes are observed, so old or unknown sessions do not become recent just because the exporter restarted. This is display expiry, not a request to terminate proxy sessions. Current API-reported routed sessions and physical TCP peers with recent payload and ACK activity by host/service/protocol/source IP, without an IP-count cap. Default order: Active + RTT, Active / QUIC, API active / no RTT, then TCP peer only; active counts descend within each group. Hysteria/Hysteria2/TUIC use QUIC, so this TCP collector cannot measure their client transport RTT: Mean RTT is N/A. API active / no RTT means the API reports routed sessions but no recent physical TCP RTT sample exists: Mean RTT is No sample. Possible reasons include Shadowsocks UDP sessions, idle TCP (last payload or ACK older than 120s by default), retained logical API sessions without a matching established TCP socket, or unavailable/unsupported collector data. It does not by itself prove disconnection; do not equate API sessions with physical TCP sockets. TCP peer only means recent payload and RTT but no corresponding active routed session, not proof of authentication or proxy use. Keepalive-only sockets expire from this table once payload has been idle for 120s by default; they remain in fleet-level socket diagnostics. Missing Active shows a dash, not a fabricated count. RTT is socket-weighted and pooled across listeners of the same protocol. Optional IPinfo flag/Organization enrichment never drops unattributed peers. All three global filters apply; NAT/relay IPs are not individual users, and country is peer-IP attribution, not verified residence.')
 source_panel['transformations'].insert(0, dict(id='merge', options={}))
 source_options = source_panel['transformations'][1]['options']
-source_options['renameByName'].update({'source_ip_display': 'Source IP', 'as_name': 'Organization', 'Value #A': 'Active', 'Value #B': 'Mean RTT'})
+source_options['renameByName'].update({'source_ip_display': 'Source IP', 'as_name': 'Organization', 'Value #A': 'Active', 'Value #B': 'Mean RTT', 'Value #C': 'State'})
 source_options['excludeByName'].update(asn=True, country_code=True, source_ip=True)
-source_options['indexByName'] = {'instance': 0, 'service': 1, 'protocol': 2, 'source_ip_display': 3, 'as_name': 4, 'Value #A': 5, 'Value #B': 6}
+source_options['indexByName'] = {'instance': 0, 'service': 1, 'protocol': 2, 'source_ip_display': 3, 'as_name': 4, 'Value #C': 5, 'Value #A': 6, 'Value #B': 7}
+source_panel['options']['sortBy'] = [dict(displayName='State', desc=False), dict(displayName='Active', desc=True)]
 source_panel['fieldConfig']['overrides'] = [dict(matcher=dict(id='byName', options=name), properties=[dict(id='custom.width', value=width)])
-    for name, width in {'Host': 45, 'Service': 95, 'Protocol': 105, 'Source IP': 165, 'Organization': 300, 'Active': 75, 'Mean RTT': 85}.items()]
+    for name, width in {'Host': 45, 'Service': 95, 'Protocol': 105, 'Source IP': 165, 'Organization': 300, 'State': 170, 'Active': 75, 'Mean RTT': 100}.items()]
 source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Organization'), properties=[dict(id='custom.wrapText', value=True)]))
-source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Mean RTT'), properties=[dict(id='unit', value='s'), dict(id='decimals', value=2)]))
+source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Mean RTT'), properties=[dict(id='unit', value='s'), dict(id='decimals', value=2), dict(id='noValue', value='No sample'), dict(id='mappings', value=[dict(type='value', options={'-1': dict(text='N/A')})])]))
+source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Active'), properties=[dict(id='noValue', value='—')]))
+source_panel['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='State'), properties=[dict(id='unit', value='none'), dict(id='mappings', value=[dict(type='value', options={
+    '1': dict(text='Active + RTT'), '2': dict(text='Active / QUIC'), '3': dict(text='API active / no RTT'), '4': dict(text='TCP peer only')})])]))
 panel('Observed source bandwidth · sampled', 'timeseries', 12, 46, 12, 8,
       [(f'sum by(instance,source_ip,direction)(rate(singbox_source_observed_bytes_total{{{HOST}}}[$__rate_interval]))', '{{instance}} · {{source_ip}} · {{direction}}')], 'Bps',
       description='All sampled client sources over the selected time range, including disconnected clients. No source-IP count cap. No connection IDs, domains, destination IPs or ephemeral ports are stored in Prometheus.')
@@ -130,24 +148,24 @@ source_bytes['options']['sortBy'] = [dict(displayName='Download', desc=True)]
 source_bytes['fieldConfig']['overrides'].extend([
     dict(matcher=dict(id='byName', options=name), properties=[dict(id='custom.width', value=115)])
     for name in ('Upload', 'Download')])
-panel('Source IPs', 'timeseries', 19, 38, 5, 8,
-      [('singbox_exporter_source_ips_active{instance=~"$host"}', '{{instance}} active'),
-       ('singbox_exporter_source_ips_tracked{instance=~"$host"}', '{{instance}} tracked')],
-      description='No source-IP count limit or overflow bucket. Active counts distinct source labels in latest service snapshots; tracked includes inactive counters retained for one hour by default. Historical chart legends can include disconnected IPs.')
+source_ips_panel = panel('Source IP counts', 'timeseries', 19, 38, 5, 8,
+      [('singbox_exporter_source_ips_active{instance=~"$host"}', '{{instance}} · Routed IPs'),
+       ('singbox_exporter_source_ips_tracked{instance=~"$host"}', '{{instance}} · Retained IPs')],
+      description='Routed IPs: distinct source IP labels in the latest sing-box API snapshots, deduplicated across services on each host. Retained IPs: distinct source IP labels whose sampled traffic counters are still retained, including active IPs and inactive IPs until the configured idle TTL expires (one hour by default). These are IP counts, not connection counts, tracking slots, all physical TCP peers, or individual users. RTT-only peers in Source connections are not counted as routed IPs. No source-IP count limit or overflow bucket. Only the Host filter applies; Service and Protocol filters do not change these host-level counts.')
 row('Client transport latency · TCP', 54)
 panel('TCP RTT · socket-weighted mean', 'timeseries', 0, 55, 12, 8,
-      [(f'sum by(instance,protocol)(singbox_tcp_rtt_snapshot_sum{{{ROUTE}}}) / sum by(instance,protocol)(singbox_tcp_rtt_snapshot_count{{{ROUTE}}})', '{{instance}} · {{protocol}}')], 's',
-      description='Passive Linux smoothed ACK round-trip time of physical client-facing TCP sockets. Not one-way or website latency. Includes pre-authentication sockets; excludes UDP/QUIC and samples whose last ACK is older than 120s by default. Idle/unsupported is no data, not zero.')
+      [(f'sum by(instance,protocol)(singbox_tcp_client_rtt_snapshot_sum{{{ROUTE}}}) / sum by(instance,protocol)(singbox_tcp_client_rtt_snapshot_count{{{ROUTE}}})', '{{instance}} · {{protocol}}')], 's',
+      description='Passive Linux smoothed ACK RTT, restricted to authenticated routed TCP sessions matched by exact inbound/source IP/source port, with payload and ACK activity within 120s. Keepalive-only and unauthenticated peers are excluded. Not one-way or website latency. UDP/QUIC has no sample; absent is a gap, not zero. Raw singbox_tcp_rtt_* metrics remain available for transport diagnostics.')
 panel('TCP RTT · current p95 / maximum', 'timeseries', 12, 55, 12, 8,
-      [(f'histogram_quantile(0.95,sum by(instance,protocol,le)(singbox_tcp_rtt_snapshot_bucket{{{ROUTE}}}))', '{{instance}} · {{protocol}} p95'),
-       (f'max by(instance,protocol)(singbox_tcp_rtt_max_seconds{{{ROUTE}}})', '{{instance}} · {{protocol}} max')], 's',
+      [(f'histogram_quantile(0.95,sum by(instance,protocol,le)(singbox_tcp_client_rtt_snapshot_bucket{{{ROUTE}}}))', '{{instance}} · {{protocol}} p95'),
+       (f'max by(instance,protocol)(singbox_tcp_client_rtt_max_seconds{{{ROUTE}}})', '{{instance}} · {{protocol}} max')], 's',
       description='p95 is a bucket-based estimate across CURRENT physical TCP sockets, not the 95th percentile of all packets or past connections. Maximum is exact for the observed SRTTs. No rate() is used on these snapshot gauges.')
 panel('TCP RTT sample coverage', 'timeseries', 0, 63, 8, 7,
-      [(f'sum by(instance,protocol)(singbox_tcp_rtt_snapshot_count{{{ROUTE}}})', '{{instance}} · {{protocol}} recent RTT'),
+      [(f'sum by(instance,protocol)(singbox_tcp_client_rtt_snapshot_count{{{ROUTE}}})', '{{instance}} · {{protocol}} authenticated recent RTT'),
        (f'sum by(instance,protocol)(singbox_tcp_established_sockets{{{ROUTE}}})', '{{instance}} · {{protocol}} established')],
-      description='Counts physical TCP sockets, not Clash routed sessions. A lower recent-RTT count means missing initialization or last ACK older than the configured idle limit. It does not indicate packet loss.')
+      description='Recent RTT counts authenticated, exact API-matched TCP sockets with recent payload and ACK. Established includes all physical listener sockets, including idle/pre-authentication peers. A gap does not indicate packet loss.')
 panel('TCP sample last-ACK age', 'timeseries', 8, 63, 8, 7,
-      [(f'max by(instance,protocol)(singbox_tcp_ack_age_max_seconds{{{ROUTE}}})', '{{instance}} · {{protocol}}')], 's',
+      [(f'max by(instance,protocol)(singbox_tcp_client_rtt_ack_age_max_seconds{{{ROUTE}}})', '{{instance}} · {{protocol}}')], 's',
       description='Oldest last-ACK age among included RTT samples. Passive sampling reads existing kernel estimates; it cannot refresh an idle connection without new traffic.')
 panel('TCP collector availability', 'timeseries', 16, 63, 8, 7,
       [('singbox_tcp_collector_up{instance=~"$host"}', '{{instance}}')],
@@ -187,34 +205,38 @@ live_table = panel('Live destinations', 'table', 0, 71, 24, 10, description=
     'Current routed TCP/UDP sessions, grouped by host/service/source/protocol/network/domain/destination/egress. '
     'Domain is best effort from client metadata or HTTP/TLS/QUIC sniffing; blank means unknown. '
     'Upload/Download are lifetime bytes of currently active sessions; Oldest is their maximum age. '
+    'The Destination view defaults to sessions with byte changes in the last 5 minutes; All open sessions includes idle ones. '
+    'Idle is the longest time since an observed byte change in the group; collector restart resets the activity baseline conservatively. '
     'All global filters apply. This view ignores the historical time range and refreshes every 5s from cached snapshots. '
     'Short-lived sessions between polls can be missed; UDP destinations describe tracked session metadata. '
-    'Unavailable collectors raise a query error instead of showing stale destinations. No history or destination metric labels.')
+    'When some selected collectors are unavailable, their Status rows explicitly report Collector unavailable while healthy hosts remain visible. '
+    'An entirely unavailable selection raises a query error. Health checks remain degraded until all selected collectors recover. '
+    'Stale destinations are never reused. No history or destination metric labels.')
 live_table['id'] = 901
 live_ds = dict(type='yesoreyeram-infinity-datasource', uid='sing-box-connections')
 live_table['datasource'] = live_ds
-columns = [('host', 'Host', 'string'), ('service', 'Service', 'string'), ('source_ip_display', 'Source IP', 'string'),
+columns = [('host', 'Host', 'string'), ('status', 'Status', 'string'), ('service', 'Service', 'string'), ('source_ip_display', 'Source IP', 'string'),
            ('protocol', 'Protocol', 'string'), ('network', 'Network', 'string'), ('domain', 'Domain', 'string'),
            ('destination', 'Destination', 'string'), ('active', 'Active', 'number'),
            ('upload_bytes', 'Upload', 'number'), ('download_bytes', 'Download', 'number'),
-           ('age_seconds', 'Oldest', 'number'), ('outbound', 'Egress', 'string')]
+           ('age_seconds', 'Oldest', 'number'), ('idle_seconds', 'Idle', 'number'), ('outbound', 'Egress', 'string')]
 live_table['targets'] = [dict(refId='A', datasource=live_ds, type='json', source='url', parser='backend',
-    format='table', url='/connections?${host:queryparam}&${service:queryparam}&${protocol:queryparam}',
+    format='table', url='/connections?${host:queryparam}&${service:queryparam}&${protocol:queryparam}&${activity:queryparam}',
     url_options=dict(method='GET'), root_selector='rows',
     columns=[dict(selector=key, text=title, type=kind) for key, title, kind in columns])]
 live_table['transformations'] = [dict(id='organize', options=dict(indexByName={title: i for i, (_, title, _) in enumerate(columns)}))]
-live_table['options']['sortBy'] = [dict(displayName='Download', desc=True)]
+live_table['options']['sortBy'] = [dict(displayName='Status', desc=False), dict(displayName='Download', desc=True)]
 live_table['fieldConfig']['defaults']['custom'].update(filterable=False)
 live_table['fieldConfig']['overrides'] = [dict(matcher=dict(id='byName', options=name),
     properties=[dict(id='custom.width', value=width)]) for name, width in
-    {'Host': 70, 'Service': 105, 'Source IP': 165, 'Protocol': 110, 'Network': 75, 'Domain': 215,
+    {'Host': 70, 'Status': 155, 'Service': 105, 'Source IP': 165, 'Protocol': 110, 'Network': 75, 'Domain': 215,
      'Destination': 185, 'Active': 65, 'Upload': 100, 'Download': 100, 'Oldest': 85, 'Egress': 110}.items()]
 for name in ('Source IP', 'Domain', 'Destination'):
     live_table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options=name),
         properties=[dict(id='custom.filterable', value=True)]))
 live_table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options='Domain'),
     properties=[dict(id='custom.wrapText', value=True)]))
-for name, unit in [('Upload', 'bytes'), ('Download', 'bytes'), ('Oldest', 's')]:
+for name, unit in [('Upload', 'bytes'), ('Download', 'bytes'), ('Oldest', 's'), ('Idle', 's')]:
     live_table['fieldConfig']['overrides'].append(dict(matcher=dict(id='byName', options=name),
         properties=[dict(id='unit', value=unit), dict(id='decimals', value=2)]))
 panels[resource_start:resource_start] = panels[live_start:]
@@ -325,7 +347,16 @@ dashboard = dict(uid='sing-box-fleet', title='sing-box monitor', tags=['sing-box
                        current=dict(text='Prometheus', value=''), options=[], refresh=1),
         variable('host', 'Host', 'label_values(singbox_up, instance)'),
         variable('service', 'Service', 'label_values(singbox_up{instance=~"$host"}, service)'),
-        variable('protocol', 'Protocol (routes / clients / RTT)', 'label_values(singbox_inbound_info{instance=~"$host",service=~"$service"}, protocol)')]),
+        variable('protocol', 'Protocol (routes / clients / RTT)', 'label_values(singbox_inbound_info{instance=~"$host",service=~"$service"}, protocol)'),
+        dict(name='source_activity', label='Source view', type='custom',
+             query='Recent traffic : recent_connections,All open sessions : connections',
+             multi=False, includeAll=False, current=dict(text='Recent traffic', value='recent_connections'),
+             options=[dict(text='Recent traffic', value='recent_connections', selected=True),
+                      dict(text='All open sessions', value='connections', selected=False)]),
+        dict(name='activity', label='Destination view', type='custom', query='Recent traffic : recent,All open sessions : all',
+             multi=False, includeAll=False, current=dict(text='Recent traffic', value='recent'),
+             options=[dict(text='Recent traffic', value='recent', selected=True),
+                      dict(text='All open sessions', value='all', selected=False)])]),
     annotations=dict(list=[dict(name='Annotations & Alerts', type='dashboard', builtIn=1, enable=True, hide=True,
                                datasource=dict(type='grafana', uid='-- Grafana --'))]), panels=panels)
 

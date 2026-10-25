@@ -1,4 +1,5 @@
 import copy
+from datetime import datetime, timezone
 import concurrent.futures
 import threading
 import time
@@ -18,7 +19,7 @@ class ConnectionViewTests(unittest.TestCase):
         self.data = dict(uploadTotal=10, downloadTotal=20, memory=0, connections=[
             dict(id='test', metadata=dict(type='shadowsocks/ss', network='tcp', sourceIP='192.0.2.1',
                 destinationIP='2001:db8::1', destinationPort='443', host='example.com'),
-                upload=10, download=20, chains=['direct'], start='2026-10-01T00:00:00Z')])
+                upload=10, download=20, chains=['direct'], start=datetime.now(timezone.utc).isoformat())])
 
     def test_metadata_is_live_json_and_never_metric_labels(self):
         self.collector.update(self.service, self.data)
@@ -34,6 +35,29 @@ class ConnectionViewTests(unittest.TestCase):
         self.data['connections'] = []
         self.collector.update(self.service, self.data)
         self.assertEqual(self.collector.connection_snapshot()['rows'], [])
+
+    def test_recent_view_tracks_byte_changes_not_creation_age(self):
+        baseline = time.time()
+        self.data['connections'][0]['start'] = datetime.fromtimestamp(baseline, timezone.utc).isoformat()
+        self.collector.update(self.service, self.data, now=baseline)
+        self.collector.update(self.service, self.data, now=baseline + 400)
+        snapshots = {'proxy': self.collector.connection_snapshot(now=baseline + 400)}
+        self.assertEqual(group_rows(snapshots, {}, now=baseline + 400), [])
+        all_rows = group_rows(snapshots, {'var-activity': ['all']}, now=baseline + 400)
+        self.assertAlmostEqual(all_rows[0]['idle_seconds'], 400, places=5)
+        self.data['connections'][0]['upload'] += 1
+        self.collector.update(self.service, self.data, now=baseline + 401)
+        snapshots = {'proxy': self.collector.connection_snapshot(now=baseline + 401)}
+        self.assertEqual(len(group_rows(snapshots, {}, now=baseline + 401)), 1)
+        with self.assertRaises(ValueError):
+            group_rows(snapshots, {'var-activity': ['bogus']}, now=baseline + 401)
+
+    def test_first_snapshot_is_conservative_and_state_disappears_with_session(self):
+        self.collector.update(self.service, self.data, now=100)
+        self.assertEqual(self.collector.state['sing-box']['activity'], {'test': 100})
+        self.data['connections'] = []
+        self.collector.update(self.service, self.data, now=101)
+        self.assertEqual(self.collector.state['sing-box']['activity'], {})
 
     def test_failure_never_serves_previous_destinations(self):
         self.collector.update(self.service, self.data)
@@ -71,10 +95,42 @@ class ConnectionViewTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             view.pool = pool
             with patch.object(view, 'fetch', side_effect=fetch_snapshot) as fetch:
+                rows = view.rows({})
+                self.assertEqual(rows[0]['host'], 'failed')
+                self.assertEqual(rows[0]['status'], 'Collector unavailable')
+                self.assertIsNone(rows[0]['active'])
+                self.assertEqual(rows[1]['status'], 'Live')
                 with self.assertRaises(ValueError):
-                    view.rows({})
+                    view.rows({}, strict=True)
+                with self.assertRaises(ValueError):
+                    view.rows({'var-host': ['failed']})
                 self.assertEqual(len(view.rows({'var-host': ['proxy']})), 1)
                 self.assertEqual(fetch.call_count, 2)
+
+    def test_partial_view_never_reuses_stale_destinations(self):
+        self.collector.update(self.service, self.data)
+        good = self.collector.connection_snapshot()
+        stale = copy.deepcopy(good)
+        stale['services'][0]['timestamp'] -= 1000
+        view = View.__new__(View)
+        view.clients = {'good': None, 'stale': None}
+        view.lock = threading.Lock()
+        view.last_fetch = time.monotonic()
+        view.snapshots = dict(good=good, stale=stale)
+        view.failures, view.countries = set(), {}
+        rows = view.rows({})
+        self.assertEqual([r['host'] for r in rows], ['stale', 'good'])
+        self.assertEqual(rows[0]['destination'], '')
+        self.assertIsNone(rows[0]['download_bytes'])
+        with self.assertRaises(ValueError):
+            view.rows({}, strict=True)
+        with self.assertRaises(ValueError):
+            view.rows({'var-host': ['stale']})
+        good['rows'] = []
+        self.assertEqual([r['host'] for r in view.rows({})], ['stale'])
+        # A fresh successful collection clears the warning without a restart.
+        view.snapshots['stale'] = copy.deepcopy(good)
+        self.assertEqual(view.rows({}), [])
 
     def test_grouping_and_all_filters_keep_traffic_totals(self):
         second = copy.deepcopy(self.data['connections'][0])
@@ -87,7 +143,8 @@ class ConnectionViewTests(unittest.TestCase):
         self.assertEqual(group_rows(snapshots, {'var-host': ['another']}), [])
         self.assertEqual(group_rows(snapshots, {'var-service': ['another']}), [])
         self.assertEqual(group_rows(snapshots, {'var-protocol': ['vless']}), [])
-        self.assertEqual(group_rows(snapshots, {'var-host': ['.*']}), rows)
+        self.assertEqual(group_rows(snapshots, {'var-host': ['.*']}, now=snapshots['proxy']['generated_at']),
+                         group_rows(snapshots, {}, now=snapshots['proxy']['generated_at']))
 
     def test_unknown_domains_stay_blank_and_control_text_is_removed(self):
         self.data['connections'][0]['metadata']['host'] = 'example.com\n\x00'

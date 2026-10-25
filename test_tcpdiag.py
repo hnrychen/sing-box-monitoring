@@ -13,7 +13,8 @@ class TcpTests(unittest.TestCase):
             'hy2': dict(type='hysteria2', port=8443)})
         self.collector = exporter.Collector(dict(services=[self.service], source_mode='raw', max_sources=2, tcp_rtt=True))
         self.record = dict(local_port=10443, peer_port=45678, local_ip='192.0.2.10', peer_ip='198.51.100.1',
-                           uid=1000, rtt_seconds=0.046, variation_seconds=0.003, ack_age_seconds=1)
+                           uid=1000, rtt_seconds=0.046, variation_seconds=0.003, ack_age_seconds=1,
+                           payload_idle_seconds=1)
 
     def test_mean_and_cumulative_snapshot_buckets(self):
         self.collector.tcp_update([self.record, dict(self.record, rtt_seconds=0.094)])
@@ -26,6 +27,27 @@ class TcpTests(unittest.TestCase):
         self.assertIn('# TYPE singbox_tcp_rtt_snapshot_bucket gauge', text)
         self.assertNotIn('protocol="hysteria2"', text)
 
+    def test_client_rtt_requires_exact_authenticated_tuple_recent_payload_and_fresh_api(self):
+        data = dict(uploadTotal=0, downloadTotal=0, memory=0, connections=[dict(id='a', upload=1, download=1,
+                    metadata=dict(type='shadowsocks/ss', sourceIP=self.record['peer_ip'],
+                                  sourcePort=str(self.record['peer_port']), network='tcp'))])
+        import time
+        now = time.time()
+        self.collector.update(self.service, data, now=now)
+        self.collector.tcp_update([dict(self.record, payload_idle_seconds=1),
+                                   dict(self.record, peer_port=45679, payload_idle_seconds=1)], now=now)
+        self.assertEqual(self.collector.tcp['clients'][('proxy', 'shadowsocks', 'ss')]['count'], 1)
+        self.assertIn('singbox_tcp_client_rtt_snapshot_sum', self.collector.render().decode())
+        self.collector.tcp_update([dict(self.record, payload_idle_seconds=90000)], now=now)
+        self.assertNotIn('singbox_tcp_client_rtt_snapshot_sum', self.collector.render().decode())
+        self.assertIn('singbox_tcp_rtt_snapshot_sum', self.collector.render().decode())
+        self.collector.state['proxy']['up'] = 0
+        self.collector.tcp_update([dict(self.record, payload_idle_seconds=1)], now=now)
+        self.assertNotIn('singbox_tcp_client_rtt_snapshot_sum', self.collector.render().decode())
+        self.collector.state['proxy']['up'] = 1
+        self.collector.tcp_update([dict(self.record, payload_idle_seconds=1)], now=now + 100)
+        self.assertEqual(self.collector.tcp['clients'][('proxy', 'shadowsocks', 'ss')]['count'], 0)
+
     def test_empty_idle_and_uninitialized_are_not_zero_latency(self):
         self.collector.tcp_update([dict(self.record, ack_age_seconds=121), dict(self.record, rtt_seconds=0)])
         text = self.collector.render().decode()
@@ -33,6 +55,23 @@ class TcpTests(unittest.TestCase):
         self.assertNotIn('singbox_tcp_rtt_snapshot_sum', text)
         self.collector.tcp_update([])
         self.assertNotIn('singbox_tcp_rtt_max_seconds', self.collector.render().decode())
+
+    def test_rtt_only_peer_requires_recent_payload_not_just_keepalive_acks(self):
+        self.collector.tcp_update([self.record])
+        self.assertIn('singbox_tcp_source_rtt_sum', self.collector.render().decode())
+        self.assertEqual(self.collector.tcp['clients'][('proxy', 'shadowsocks', 'ss')]['count'], 0)
+        self.collector.tcp_update([dict(self.record, payload_idle_seconds=4 * 86400)])
+        text = self.collector.render().decode()
+        self.assertNotIn('singbox_tcp_source_rtt_', text)
+        self.assertIn('singbox_tcp_rtt_snapshot_sum', text)  # Raw diagnostics remain available.
+        self.collector.tcp_update([dict(self.record, payload_idle_seconds=120)])
+        self.assertIn('singbox_tcp_source_rtt_sum', self.collector.render().decode())
+        self.collector.tcp_update([dict(self.record, payload_idle_seconds=121)])
+        self.assertNotIn('singbox_tcp_source_rtt_', self.collector.render().decode())
+        record_without_payload = self.record.copy()
+        del record_without_payload['payload_idle_seconds']
+        self.collector.tcp_update([record_without_payload])
+        self.assertNotIn('singbox_tcp_source_rtt_', self.collector.render().decode())
 
     def test_ownership_bind_and_ambiguous_listener_guard(self):
         self.collector.tcp_update([dict(self.record, uid=0)])
@@ -75,6 +114,8 @@ class TcpTests(unittest.TestCase):
             payload[24:40] = socket.inet_pton(family, peer).ljust(16, b'\0')
             struct.pack_into('=I', payload, 64, 1000)
             info = bytearray(104)
+            struct.pack_into('=I', info, 44, 90000000)
+            struct.pack_into('=I', info, 52, 3000000)
             struct.pack_into('=I', info, 56, 1234)
             struct.pack_into('=II', info, 68, 46000, 3000)
             decoded = tcpdiag.decode(payload + struct.pack('=HH', 108, 2) + info)
@@ -82,6 +123,7 @@ class TcpTests(unittest.TestCase):
             self.assertEqual(decoded['local_port'], 10443)
             self.assertAlmostEqual(decoded['rtt_seconds'], 0.046)
             self.assertAlmostEqual(decoded['ack_age_seconds'], 1.234)
+            self.assertEqual(decoded['payload_idle_seconds'], 3000)
 
     def test_malformed_attributes_rejected(self):
         with self.assertRaises(ValueError):
