@@ -257,6 +257,7 @@ class Collector:
         inventory = service.get('inbounds', {})
         valid_outbounds = set(service.get('outbounds', [])) | {'direct', 'DIRECT'}
         groups = collections.defaultdict(lambda: [0, 0, 0, 0])
+        route_activity = collections.defaultdict(list)
         sources = collections.defaultdict(lambda: [0, 0, 0])
         source_protocols = collections.defaultdict(int)
         observed = collections.defaultdict(lambda: [0, 0, 0], {k: v.copy() for k, v in old.get('observed', {}).items()})
@@ -308,6 +309,7 @@ class Collector:
                 except (KeyError, ValueError, TypeError):
                     activity[cid] = 0
             source_activity[source_protocol].append(activity[cid])
+            route_activity[group].append(activity[cid])
             if network == 'tcp' and protocol not in ('hysteria', 'hysteria2', 'tuic'):
                 try:
                     ip = ipaddress.ip_address(str(md.get('sourceIP', '')))
@@ -370,7 +372,7 @@ class Collector:
                 observed[(info['type'], inbound, network, 'direct')]
         self.state[name] = dict(up=1, timestamp=now, totals=totals, memory=data['memory'],
                                 groups=groups, sources=sources, source_protocols=source_protocols, previous=following,
-                                activity=activity, source_activity=source_activity, tcp_endpoints=endpoints,
+                                activity=activity, source_activity=source_activity, route_activity=route_activity, tcp_endpoints=endpoints,
                                 observed=observed, source_observed=source_observed, source_seen=source_seen,
                                 errors=old.get('errors', 0), resets=old.get('resets', 0) + int(reset),
                                 dropped=dropped, connections=len(connections), details=details, duration=0)
@@ -433,10 +435,15 @@ class Collector:
                     m.add('traffic_bytes_total', value, dict(tags, direction=direction), 'Exact API payload bytes since sing-box start; excludes transport overhead.', 'counter')
                 m.add('memory_bytes', s['memory'], tags, 'Sing-box API in-use Go memory, not RSS.')
                 m.add('connections', s['connections'], tags, 'Active routed connections/UDP sessions; DNS outbound excluded.')
+                now = time.time()
+                recent_by_route = {key: sum(t > 0 and now - t <= 300 for t in activity)
+                                   for key, activity in s.get('route_activity', {}).items()}
+                m.add('recent_connections', sum(recent_by_route.values()), tags, 'Routed sessions with observed payload activity within five minutes; idle API sessions excluded.')
                 m.add('label_overflow_connections', s['dropped'], tags, 'Connections assigned to overflow route labels.')
                 for key, values in s['groups'].items():
                     gtags = dict(tags, **dict(zip(('protocol', 'inbound', 'network', 'outbound'), key)))
                     m.add('route_connections', values[0], gtags, 'Active routed connections by inbound protocol, network and egress.')
+                    m.add('route_recent_connections', recent_by_route.get(key, 0), gtags, 'Routed sessions with payload activity within five minutes by protocol, network and egress.')
                     m.add('route_oldest_connection_seconds', values[3], gtags, 'Age of oldest active connection.')
                     for direction, value in zip(('upload', 'download'), values[1:3]):
                         m.add('route_active_bytes', value, dict(gtags, direction=direction), 'Lifetime bytes of currently active connections; gauge, NOT a counter.')
@@ -452,7 +459,7 @@ class Collector:
                         m.add('source_active_bytes', value, dict(stags, direction=direction), 'Lifetime bytes of active connections for this source.')
                 for (protocol, source), count in s['source_protocols'].items():
                     m.add('source_protocol_connections', count, dict(tags, protocol=protocol, source_ip=source), 'Active routed sessions by protocol and source IP; no IP-count cap.')
-                    recent = sum(t > 0 and time.time() - t <= 300 for t in s.get('source_activity', {}).get((protocol, source), []))
+                    recent = sum(t > 0 and now - t <= 300 for t in s.get('source_activity', {}).get((protocol, source), []))
                     m.add('source_protocol_recent_connections', recent, dict(tags, protocol=protocol, source_ip=source), 'Current routed sessions with observed payload activity within five minutes.')
                 for source, values in s['source_observed'].items():
                     for direction, value in zip(('upload', 'download'), values):

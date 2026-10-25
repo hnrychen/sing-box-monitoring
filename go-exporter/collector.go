@@ -93,6 +93,7 @@ type State struct {
 	SourceObserved                              map[string]Pair
 	Protocols                                   map[SourceProtocol]float64
 	SourceActivity                              map[SourceProtocol][]float64
+	RouteActivity                               map[Route][]float64
 	Seen                                        map[string]float64
 	Previous                                    map[string]Pair
 	Activity                                    map[string]float64
@@ -163,6 +164,10 @@ func source(c Config, address string) string {
 		return "unknown"
 	}
 	if c.SourceMode == "raw" {
+		if ip.Is4In6() {
+			b := ip.As16()
+			return fmt.Sprintf("::ffff:%x:%x", uint16(b[12])<<8|uint16(b[13]), uint16(b[14])<<8|uint16(b[15]))
+		}
 		return ip.String()
 	}
 	bits := 64
@@ -301,6 +306,10 @@ func (c *Collector) update(s Service, data Snapshot, now float64) error {
 		}
 		k := SourceProtocol{protocol, ip}
 		n.SourceActivity[k] = append(n.SourceActivity[k], n.Activity[cid])
+		if n.RouteActivity == nil {
+			n.RouteActivity = map[Route][]float64{}
+		}
+		n.RouteActivity[route] = append(n.RouteActivity[route], n.Activity[cid])
 		if network == "tcp" && !udpProtocol(protocol) {
 			ip, err := netip.ParseAddr(stringValue(md["sourceIP"]))
 			port, e := number(md["sourcePort"])

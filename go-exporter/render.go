@@ -117,10 +117,22 @@ func (c *Collector) render(now float64) []byte {
 		m.counter("traffic_bytes_total", state.Totals[1], extend(t, "direction", "download"))
 		m.gauge("memory_bytes", state.Memory, t)
 		m.gauge("connections", float64(state.Connections), t)
+		recentByRoute := map[Route]float64{}
+		recentTotal := float64(0)
+		for route, activity := range state.RouteActivity {
+			for _, at := range activity {
+				if at > 0 && now-at <= 300 {
+					recentByRoute[route]++
+					recentTotal++
+				}
+			}
+		}
+		m.gauge("recent_connections", recentTotal, t)
 		m.gauge("label_overflow_connections", float64(state.Dropped), t)
 		for key, v := range state.Groups {
 			tags := routeTags(s.Name, key)
 			m.gauge("route_connections", v[0], tags)
+			m.gauge("route_recent_connections", recentByRoute[key], tags)
 			m.gauge("route_oldest_connection_seconds", v[3], tags)
 			m.gauge("route_active_bytes", v[1], extend(tags, "direction", "upload"))
 			m.gauge("route_active_bytes", v[2], extend(tags, "direction", "download"))

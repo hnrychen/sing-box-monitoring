@@ -71,8 +71,12 @@ row('Fleet overview', 0)
 panel('Services', 'stat', 0, 1, 4, 4,
       [(f'sum(singbox_up{{{HOST}}})', 'Healthy'), (f'count(singbox_up{{{HOST}}})', 'Configured')],
       description='Every configured sing-box service must have a fresh successful API snapshot. Zero is a failure, not idle traffic.')
-panel('Connections', 'stat', 4, 1, 4, 4, [(f'sum(singbox_connections{{{HOST}}})', 'Active')],
-      description='Live routed connections and UDP sessions. DNS outbound excluded. Independent of protocol filter.')
+CONNECTION_DESCRIPTION = ('Connection view applies here and to Source connections: Recent traffic counts each '
+    'routed session only while its last observed payload byte change is within five minutes. '
+    'All open sessions shows the full current API inventory, including idle logical sessions. '
+    'Idle is not proof of disconnection; no sessions are terminated. Historical points retain their value at that time.')
+panel('Connections', 'stat', 4, 1, 4, 4, [(f'sum(singbox_route_${{source_activity}}{{{ROUTE}}})', 'Active')],
+      description=CONNECTION_DESCRIPTION + ' Host, Service and Protocol filters apply; DNS outbound excluded.')
 panel('Upload', 'stat', 8, 1, 4, 4, [(f'sum(rate(singbox_traffic_bytes_total{{{HOST},direction="upload"}}[$__rate_interval]))', 'Client → destination')], 'Bps')
 panel('Download', 'stat', 12, 1, 4, 4, [(f'sum(rate(singbox_traffic_bytes_total{{{HOST},direction="download"}}[$__rate_interval]))', 'Destination → client')], 'Bps')
 panel('Period traffic', 'stat', 16, 1, 4, 4, [(f'sum(increase(singbox_traffic_bytes_total{{{HOST}}}[$__range]))', 'Payload')], 'bytes',
@@ -87,9 +91,14 @@ panel('Payload bandwidth by host', 'timeseries', 8, 5, 16, 7,
       description='Exact service counters. Includes connections that begin and end between polls. Upload and download are both positive.')
 row('Protocols, connections and routing', 12)
 panel('Active connections by protocol', 'timeseries', 0, 13, 12, 8,
-      [(f'sum by(instance,protocol)(singbox_route_connections{{{ROUTE}}})', '{{instance}} · {{protocol}}')])
+      [(f'sum by(instance,protocol)(singbox_route_${{source_activity}}{{{ROUTE}}})', '{{instance}} · {{protocol}}')],
+      description=CONNECTION_DESCRIPTION)
 panel('TCP / UDP / ICMP sessions', 'timeseries', 12, 13, 12, 8,
-      [(f'sum by(network)(singbox_route_connections{{{ROUTE}}})', '{{network}}')])
+      [(f'sum by(network)(singbox_route_${{source_activity}}{{{ROUTE}}})', '{{network}}')],
+      description=CONNECTION_DESCRIPTION)
+for connection_panel in panels[-2:]:
+    # Ended series must not display their last historical value as current.
+    connection_panel['options']['legend']['calcs'] = ['last', 'max']
 panel('Observed protocol bandwidth · sampled', 'timeseries', 0, 21, 12, 8,
       [(f'sum by(instance,protocol,direction)(rate(singbox_route_observed_bytes_total{{{ROUTE}}}[$__rate_interval]))', '{{instance}} · {{protocol}} · {{direction}}')], 'Bps',
       description='Lower-bound breakdown; API sampling interval is configurable per host. Short connections and traffic after their last sample are not attributed; use fleet totals for total traffic.')
@@ -97,7 +106,7 @@ panel('Observed new connections · sampled', 'timeseries', 12, 21, 12, 8,
       [(f'sum by(instance,protocol)(rate(singbox_route_observed_connections_total{{{ROUTE}}}[$__rate_interval]))', '{{instance}} · {{protocol}}')], 'cps',
       description='New sessions observed after first snapshot. Not exact connection acceptance or failed authentication counts.')
 panel('Active routing paths', 'table', 0, 29, 16, 8,
-      [(f'singbox_route_connections{{{ROUTE}}} > 0', '')], description='Protocol/inbound/network/egress intersections, not just separate filters.')
+      [(f'singbox_route_${{source_activity}}{{{ROUTE}}} > 0', '')], description=CONNECTION_DESCRIPTION + ' Protocol/inbound/network/egress intersections.')
 panel('Configured protocol listeners', 'table', 16, 29, 8, 8,
       [(f'singbox_inbound_info{{{ROUTE}}}', '')], description='Inventory includes idle listeners. API collection health is shown above; inventory is not a synthetic connectivity probe.')
 row('Source clients', 37)
@@ -244,7 +253,7 @@ del panels[live_start + 2:]
 
 # Reuse existing counters for an instant operational summary, not extra polling.
 activity = panel('Service activity', 'table', 0, 5, 8, 7,
-    [(f'max by(instance,service)(singbox_connections{{{HOST}}})', ''),
+    [(f'max by(instance,service)(singbox_${{source_activity}}{{{HOST}}})', ''),
      (f'sum by(instance,service)(rate(singbox_traffic_bytes_total{{{HOST},direction="upload"}}[$__rate_interval]))', ''),
      (f'sum by(instance,service)(rate(singbox_traffic_bytes_total{{{HOST},direction="download"}}[$__rate_interval]))', ''),
      (f'max by(instance,service)(singbox_process_uptime_seconds{{{HOST}}})', '')],
@@ -348,7 +357,7 @@ dashboard = dict(uid='sing-box-fleet', title='sing-box monitor', tags=['sing-box
         variable('host', 'Host', 'label_values(singbox_up, instance)'),
         variable('service', 'Service', 'label_values(singbox_up{instance=~"$host"}, service)'),
         variable('protocol', 'Protocol (routes / clients / RTT)', 'label_values(singbox_inbound_info{instance=~"$host",service=~"$service"}, protocol)'),
-        dict(name='source_activity', label='Source view', type='custom',
+        dict(name='source_activity', label='Connection view', type='custom',
              query='Recent traffic : recent_connections,All open sessions : connections',
              multi=False, includeAll=False, current=dict(text='Recent traffic', value='recent_connections'),
              options=[dict(text='Recent traffic', value='recent_connections', selected=True),
