@@ -127,7 +127,10 @@ class Collector:
             return 'hidden'
         try:
             ip = ipaddress.ip_address(address)
-            address = str(ip) if mode == 'raw' else str(ipaddress.ip_network(f'{ip}/{24 if ip.version == 4 else 64}', strict=False))
+            if mode == 'raw':
+                address = f'::ffff:{ip.ipv4_mapped}' if getattr(ip, 'ipv4_mapped', None) else str(ip)
+            else:
+                address = str(ipaddress.ip_network(f'{ip}/{24 if ip.version == 4 else 64}', strict=False))
         except ValueError:
             return 'unknown'
         return address
