@@ -105,7 +105,7 @@
       },
       {
         "name": "source_activity",
-        "label": "Source view",
+        "label": "Connection view",
         "type": "custom",
         "query": "Recent traffic : recent_connections,All open sessions : connections",
         "multi": false,
@@ -322,7 +322,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Live routed connections and UDP sessions. DNS outbound excluded. Independent of protocol filter.",
+      "description": "Connection view applies here and to Source connections: Recent traffic counts each routed session only while its last observed payload byte change is within five minutes. All open sessions shows the full current API inventory, including idle logical sessions. Idle is not proof of disconnection; no sessions are terminated. Historical points retain their value at that time. Host, Service and Protocol filters apply; DNS outbound excluded.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -370,7 +370,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(singbox_connections{instance=~\"$host\",service=~\"$service\"})",
+          "expr": "sum(singbox_route_${source_activity}{instance=~\"$host\",service=~\"$service\",protocol=~\"$protocol\"})",
           "legendFormat": "Active",
           "datasource": {
             "type": "prometheus",
@@ -692,7 +692,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "One row per host/service at the selected dashboard end time. Active is current routed sessions; Upload/Download are exact payload counter rates averaged over $__rate_interval. Uptime is process age. Host and Service filters apply; protocol filter does not, matching fleet totals. Failed API snapshots omit traffic/connection values rather than reporting zero; missing values stay blank. This is activity, not an end-to-end connectivity test.",
+      "description": "Connection view applies here and to Source connections: Recent traffic counts each routed session only while its last observed payload byte change is within five minutes. All open sessions shows the full current API inventory, including idle logical sessions. Idle is not proof of disconnection; no sessions are terminated. Historical points retain their value at that time. One row per host/service at the selected dashboard end time. Upload/Download are exact payload counter rates averaged over $__rate_interval. Uptime is process age. Host and Service filters apply; this service summary does not split protocols. Failed API snapshots omit traffic/connection values rather than reporting zero; missing values stay blank. This is activity, not an end-to-end connectivity test.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -844,7 +844,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by(instance,service)(singbox_connections{instance=~\"$host\",service=~\"$service\"})",
+          "expr": "max by(instance,service)(singbox_${source_activity}{instance=~\"$host\",service=~\"$service\"})",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -1056,7 +1056,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "",
+      "description": "Connection view applies here and to Source connections: Recent traffic counts each routed session only while its last observed payload byte change is within five minutes. All open sessions shows the full current API inventory, including idle logical sessions. Idle is not proof of disconnection; no sessions are terminated. Historical points retain their value at that time.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -1083,7 +1083,7 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "last",
             "max"
           ]
         },
@@ -1095,7 +1095,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by(instance,protocol)(singbox_route_connections{instance=~\"$host\",service=~\"$service\",protocol=~\"$protocol\"})",
+          "expr": "sum by(instance,protocol)(singbox_route_${source_activity}{instance=~\"$host\",service=~\"$service\",protocol=~\"$protocol\"})",
           "legendFormat": "{{instance}} \u00b7 {{protocol}}",
           "datasource": {
             "type": "prometheus",
@@ -1121,7 +1121,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "",
+      "description": "Connection view applies here and to Source connections: Recent traffic counts each routed session only while its last observed payload byte change is within five minutes. All open sessions shows the full current API inventory, including idle logical sessions. Idle is not proof of disconnection; no sessions are terminated. Historical points retain their value at that time.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -1148,7 +1148,7 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "last",
             "max"
           ]
         },
@@ -1160,7 +1160,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by(network)(singbox_route_connections{instance=~\"$host\",service=~\"$service\",protocol=~\"$protocol\"})",
+          "expr": "sum by(network)(singbox_route_${source_activity}{instance=~\"$host\",service=~\"$service\",protocol=~\"$protocol\"})",
           "legendFormat": "{{network}}",
           "datasource": {
             "type": "prometheus",
@@ -1316,7 +1316,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Protocol/inbound/network/egress intersections, not just separate filters.",
+      "description": "Connection view applies here and to Source connections: Recent traffic counts each routed session only while its last observed payload byte change is within five minutes. All open sessions shows the full current API inventory, including idle logical sessions. Idle is not proof of disconnection; no sessions are terminated. Historical points retain their value at that time. Protocol/inbound/network/egress intersections.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -1496,7 +1496,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "singbox_route_connections{instance=~\"$host\",service=~\"$service\",protocol=~\"$protocol\"} > 0",
+          "expr": "singbox_route_${source_activity}{instance=~\"$host\",service=~\"$service\",protocol=~\"$protocol\"} > 0",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -1842,7 +1842,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Source view defaults to Recent traffic: routed sessions expire individually after five minutes without observed payload byte changes. Counts include only those recent sessions; All open sessions includes idle API sessions. A collector restart uses session start time until new byte changes are observed, so old or unknown sessions do not become recent just because the exporter restarted. This is display expiry, not a request to terminate proxy sessions. Current API-reported routed sessions and physical TCP peers with recent payload and ACK activity by host/service/protocol/source IP, without an IP-count cap. Default order: Active + RTT, Active / QUIC, API active / no RTT, then TCP peer only; active counts descend within each group. Hysteria/Hysteria2/TUIC use QUIC, so this TCP collector cannot measure their client transport RTT: Mean RTT is N/A. API active / no RTT means the API reports routed sessions but no recent physical TCP RTT sample exists: Mean RTT is No sample. Possible reasons include Shadowsocks UDP sessions, idle TCP (last payload or ACK older than 120s by default), retained logical API sessions without a matching established TCP socket, or unavailable/unsupported collector data. It does not by itself prove disconnection; do not equate API sessions with physical TCP sockets. TCP peer only means recent payload and RTT but no corresponding active routed session, not proof of authentication or proxy use. Keepalive-only sockets expire from this table once payload has been idle for 120s by default; they remain in fleet-level socket diagnostics. Missing Active shows a dash, not a fabricated count. RTT is socket-weighted and pooled across listeners of the same protocol. Optional IPinfo flag/Organization enrichment never drops unattributed peers. All three global filters apply; NAT/relay IPs are not individual users, and country is peer-IP attribution, not verified residence.",
+      "description": "Connection view applies here and to Source connections: Recent traffic counts each routed session only while its last observed payload byte change is within five minutes. All open sessions shows the full current API inventory, including idle logical sessions. Idle is not proof of disconnection; no sessions are terminated. Historical points retain their value at that time. Current API-reported routed sessions and physical TCP peers with recent payload and ACK activity by host/service/protocol/source IP, without an IP-count cap. Default order: Active + RTT, Active / QUIC, API active / no RTT, then TCP peer only; active counts descend within each group. Hysteria/Hysteria2/TUIC use QUIC, so this TCP collector cannot measure their client transport RTT: Mean RTT is N/A. API active / no RTT means the API reports routed sessions but no recent physical TCP RTT sample exists: Mean RTT is No sample. Possible reasons include Shadowsocks UDP sessions, idle TCP (last payload or ACK older than 120s by default), retained logical API sessions without a matching established TCP socket, or unavailable/unsupported collector data. It does not by itself prove disconnection; do not equate API sessions with physical TCP sockets. TCP peer only means recent payload and RTT but no corresponding active routed session, not proof of authentication or proxy use. Keepalive-only sockets expire from this table once payload has been idle for 120s by default; they remain in fleet-level socket diagnostics. Missing Active shows a dash, not a fabricated count. RTT is socket-weighted and pooled across listeners of the same protocol. Optional IPinfo flag/Organization enrichment never drops unattributed peers. All three global filters apply; NAT/relay IPs are not individual users, and country is peer-IP attribution, not verified residence.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",

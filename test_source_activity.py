@@ -17,6 +17,9 @@ class SourceActivityTests(unittest.TestCase):
     def counts(self, now):
         with patch.object(exporter.time, 'time', return_value=now):
             lines = self.collector.render().decode().splitlines()
+        rollups = {name: sum(float(line.rsplit(' ', 1)[1]) for line in lines if line.startswith(name + '{'))
+                   for name in ('singbox_recent_connections','singbox_route_recent_connections','singbox_source_protocol_recent_connections')}
+        self.assertEqual(len(set(rollups.values())),1,rollups)
         return {name: sum(float(line.rsplit(' ', 1)[1]) for line in lines if line.startswith(name + '{'))
                 for name in ('singbox_source_protocol_connections', 'singbox_source_protocol_recent_connections')}
 
@@ -50,6 +53,23 @@ class SourceActivityTests(unittest.TestCase):
         self.collector.update(self.service, self.data, now=1020)
         self.assertEqual(self.collector.state['core']['source_activity'], {})
         self.assertEqual(self.counts(1020)['singbox_source_protocol_recent_connections'], 0)
+
+    def test_network_routes_share_activity_without_reviving_idle_siblings(self):
+        self.data['connections'] += [dict(copy.deepcopy(self.data['connections'][0]),id='udp',metadata=dict(type='shadowsocks/ss',network='udp',sourceIP='192.0.2.1'))]
+        self.collector.update(self.service,self.data,now=1000)
+        self.data['connections'][1]['download'] += 1
+        self.collector.update(self.service,self.data,now=1010)
+        self.assertEqual(self.counts(1010)['singbox_source_protocol_recent_connections'],1)
+        with patch.object(exporter.time,'time',return_value=1010):
+            lines=self.collector.render().decode().splitlines()
+        routes=[line for line in lines if line.startswith('singbox_route_recent_connections{')]
+        self.assertTrue(any('network="udp"' in l and l.endswith(' 1') for l in routes))
+        self.assertTrue(any('network="tcp"' in l and l.endswith(' 0') for l in routes))
+        self.collector.state['core']['up']=0
+        with patch.object(exporter.time,'time',return_value=1010):
+            text=self.collector.render().decode()
+        self.assertNotIn('\nsingbox_recent_connections{',text)
+        self.assertNotIn('\nsingbox_route_recent_connections{',text)
 
 
 if __name__ == '__main__':

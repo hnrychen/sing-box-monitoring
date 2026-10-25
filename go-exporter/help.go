@@ -6,6 +6,8 @@ var metricHelp = map[string]string{
 	"collection_duration_seconds":                   "Local snapshot collection duration.",
 	"collection_errors_total":                       "Failed snapshots.",
 	"connections":                                   "Active routed connections/UDP sessions; DNS outbound excluded.",
+	"recent_connections":                            "Routed sessions with observed payload activity within five minutes; idle API sessions excluded.",
+	"route_recent_connections":                      "Routed sessions with payload activity within five minutes by protocol, network and egress.",
 	"exporter_build_info":                           "Exporter build version.",
 	"exporter_certificate_expiry_timestamp_seconds": "HTTPS certificate expiry; renew and restart exporter before this time.",
 	"exporter_cpu_seconds_total":                    "Exporter CPU time.",
